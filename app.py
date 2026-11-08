@@ -8,6 +8,24 @@ import logging
 from threading import Thread
 from typing import List, Optional, AsyncGenerator
 
+# --- ZeroGPU Compatibility Layer ---
+# CRITICAL: 'spaces' MUST be imported BEFORE 'torch' for Hugging Face ZeroGPU to intercept CUDA!
+try:
+    import spaces
+    HAS_SPACES = True
+    print("Hugging Face ZeroGPU environment detected.")
+except ImportError:
+    HAS_SPACES = False
+    print("Running in standard environment (local / CPU).")
+
+    # Mock spaces.GPU decorator for local execution
+    class spaces:
+        @staticmethod
+        def GPU(duration=120):
+            def decorator(fn):
+                return fn
+            return decorator
+
 import torch
 from transformers import (
     AutoTokenizer,
@@ -30,24 +48,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
 )
 logger = logging.getLogger("HermesLocalServer")
-
-# --- ZeroGPU Compatibility Layer ---
-# Enables free Nvidia A100 GPU acceleration on Hugging Face Spaces
-try:
-    import spaces
-    HAS_SPACES = True
-    logger.info("Hugging Face ZeroGPU environment detected.")
-except ImportError:
-    HAS_SPACES = False
-    logger.info("Running in standard environment (local / CPU).")
-
-    # Mock spaces.GPU decorator for local execution
-    class spaces:
-        @staticmethod
-        def GPU(duration=120):
-            def decorator(fn):
-                return fn
-            return decorator
 
 # --- Configuration ---
 MODEL_ID = os.getenv("MODEL_ID", "NousResearch/Hermes-3-Llama-3.1-8B")
@@ -333,9 +333,9 @@ async def health_check():
 async def list_models():
     """OpenAI-compatible models catalog endpoint."""
     models = [
-        ModelCard(id=MODEL_ID, root=MODEL_ID),
-        ModelCard(id="Hermes-3-8B", root=MODEL_ID),
-        ModelCard(id="NousResearch/Hermes-3-Llama-3.1-8B", root=MODEL_ID)
+        ModelCard(id=MODEL_ID),
+        ModelCard(id="Hermes-3-8B"),
+        ModelCard(id="NousResearch/Hermes-3-Llama-3.1-8B")
     ]
     return {
         "object": "list",
