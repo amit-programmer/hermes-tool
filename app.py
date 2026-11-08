@@ -1472,9 +1472,6 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
           <button class="icon-action-btn danger" id="clearChatBtn" title="Clear Chat History">
             🗑️
           </button>
-          <button class="icon-action-btn" id="themeToggleBtn" title="Toggle Dark / Light Theme">
-            🌙
-          </button>
         </div>
 
         <!-- Inner Menu Dark / Light Selector (Segmented Pill) -->
