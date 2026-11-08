@@ -544,6 +544,15 @@ try:
     app = gr.mount_gradio_app(app, demo, path="/")
     logger.info("Gradio UI mounted on root path.")
 
+    # Explicitly trigger ZeroGPU registration hook so Uvicorn ASGI registers GPU functions
+    try:
+        from spaces import zero as _spaces_zero
+        if hasattr(_spaces_zero, "startup"):
+            _spaces_zero.startup()
+            logger.info("[ZeroGPU] spaces.zero.startup() registered successfully.")
+    except Exception as hook_err:
+        logger.info(f"[ZeroGPU] Startup hook note: {hook_err}")
+
 except ImportError:
     @app.get("/")
     def root_endpoint():
@@ -559,5 +568,13 @@ except ImportError:
         }
 
 if __name__ == "__main__":
+    try:
+        from spaces import zero as _spaces_zero
+        if hasattr(_spaces_zero, "startup"):
+            _spaces_zero.startup()
+            print("[ZeroGPU] spaces.zero.startup() triggered before uvicorn.", flush=True)
+    except Exception as e:
+        pass
+
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=7860, reload=False)
