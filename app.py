@@ -142,7 +142,6 @@ def load_local_model():
         device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info(f"2. Target device detected: {device.upper()} (ZeroGPU: {HAS_SPACES})")
 
-        # Use native bfloat16 for fast execution without 4-bit dequantization overhead
         dtype = torch.bfloat16 if (torch.cuda.is_available() or HAS_SPACES or torch.cuda.is_bf16_supported()) else torch.float32
         logger.info(f"   Mounting model with native dtype: {dtype}...")
         model = AutoModelForCausalLM.from_pretrained(
@@ -536,7 +535,7 @@ async def all_exception_handler(request: Request, exc: Exception):
         content={"detail": "Internal Server Error", "error": str(exc), "path": request.url.path}
     )
 
-# --- Professional Interactive Web Chatbot Playground (HTML5 + CSS3 + Vanilla JS) ---
+# --- Clean Full-Width Interactive Web Chatbot Playground (HTML5 + CSS3 + Vanilla JS) ---
 HTML_PLAYGROUND = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -572,238 +571,67 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       background: var(--bg-dark);
       color: var(--text-main);
       display: flex;
+      flex-direction: column;
       height: 100vh;
       overflow: hidden;
     }
 
-    /* Sidebar */
-    .sidebar {
-      width: 300px;
+    /* Top Navigation Header */
+    .top-header {
       background: #0d1322;
-      border-right: 1px solid var(--border-color);
-      display: flex;
-      flex-direction: column;
-      justify-content: space-between;
-      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-      z-index: 50;
-    }
-    .sidebar.closed {
-      margin-left: -300px;
-    }
-    .sidebar-header {
-      padding: 18px 20px;
       border-bottom: 1px solid var(--border-color);
+      padding: 12px 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      z-index: 20;
+    }
+    .brand-group {
       display: flex;
       align-items: center;
       gap: 12px;
     }
     .brand-avatar {
-      width: 38px;
-      height: 38px;
-      border-radius: 10px;
+      width: 36px;
+      height: 36px;
+      border-radius: 9px;
       background: linear-gradient(135deg, #3b82f6, #8b5cf6);
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 1.25rem;
-      box-shadow: 0 0 15px var(--accent-glow);
+      font-size: 1.2rem;
+      box-shadow: 0 0 14px var(--accent-glow);
+    }
+    .brand-details {
+      display: flex;
+      flex-direction: column;
     }
     .brand-title {
       font-size: 1.05rem;
       font-weight: 700;
-      letter-spacing: -0.02em;
       color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 8px;
     }
     .brand-badge {
       font-size: 0.65rem;
       color: #38bdf8;
       background: rgba(56, 189, 248, 0.12);
-      padding: 2px 6px;
+      padding: 2px 7px;
       border-radius: 4px;
       font-weight: 600;
-      margin-top: 2px;
-      display: inline-block;
+      letter-spacing: 0.04em;
     }
-    .new-chat-btn {
-      margin: 16px;
-      background: linear-gradient(135deg, #2563eb, #4f46e5);
-      color: #ffffff;
-      border: 1px solid rgba(255, 255, 255, 0.15);
-      padding: 10px 16px;
-      border-radius: 8px;
-      font-size: 0.88rem;
-      font-weight: 600;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-      cursor: pointer;
-      box-shadow: 0 4px 12px rgba(37, 99, 235, 0.25);
-      transition: all 0.2s;
-    }
-    .new-chat-btn:hover {
-      background: linear-gradient(135deg, #1d4ed8, #4338ca);
-      transform: translateY(-1px);
-    }
-    .sidebar-content {
-      flex: 1;
-      padding: 0 16px;
-      overflow-y: auto;
-      display: flex;
-      flex-direction: column;
-      gap: 16px;
-    }
-    .section-title {
+    .status-pill {
       font-size: 0.72rem;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: var(--text-dim);
-      font-weight: 700;
-      margin-bottom: 8px;
-    }
-    .config-card {
-      background: rgba(30, 41, 59, 0.5);
-      border: 1px solid var(--border-color);
-      border-radius: 8px;
-      padding: 14px;
-    }
-    .config-label {
-      font-size: 0.8rem;
-      color: var(--text-muted);
-      margin-bottom: 6px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    .config-val {
-      color: #38bdf8;
-      font-weight: 600;
-      font-family: 'JetBrains Mono', monospace;
-    }
-    .config-input {
-      width: 100%;
-      accent-color: var(--primary);
-      cursor: pointer;
-    }
-    .persona-box {
-      width: 100%;
-      height: 90px;
-      background: #090d16;
-      border: 1px solid var(--border-color);
-      color: #cbd5e1;
-      padding: 8px 10px;
-      border-radius: 6px;
-      font-size: 0.76rem;
-      line-height: 1.4;
-      resize: vertical;
-      font-family: inherit;
-      outline: none;
-    }
-    .persona-box:focus { border-color: var(--primary); }
-
-    /* Telemetry Card */
-    .telemetry-card {
-      background: rgba(16, 185, 129, 0.05);
-      border: 1px solid rgba(16, 185, 129, 0.2);
-      border-radius: 8px;
-      padding: 12px;
-      font-size: 0.76rem;
-    }
-    .telemetry-item {
-      display: flex;
-      justify-content: space-between;
-      margin-bottom: 4px;
-      color: var(--text-muted);
-    }
-    .telemetry-item span.highlight {
-      color: #34d399;
-      font-weight: 600;
-      font-family: 'JetBrains Mono', monospace;
-    }
-
-    /* Sidebar Footer Links */
-    .sidebar-footer {
-      padding: 16px;
-      border-top: 1px solid var(--border-color);
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-    .quick-link {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      color: var(--text-muted);
-      text-decoration: none;
-      font-size: 0.82rem;
-      padding: 7px 10px;
-      border-radius: 6px;
-      transition: all 0.2s;
-    }
-    .quick-link:hover {
-      background: rgba(59, 130, 246, 0.1);
-      color: #fff;
-    }
-
-    /* Main Chat Area */
-    .chat-layout {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      height: 100vh;
-      background: var(--bg-dark);
-      position: relative;
-    }
-    .chat-header {
-      padding: 14px 24px;
-      background: #0d1322;
-      border-bottom: 1px solid var(--border-color);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      z-index: 10;
-    }
-    .header-left {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-    }
-    .menu-toggle-btn {
-      background: transparent;
-      border: 1px solid var(--border-color);
-      color: var(--text-muted);
-      width: 34px;
-      height: 34px;
-      border-radius: 6px;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 1rem;
-      transition: all 0.2s;
-    }
-    .menu-toggle-btn:hover {
-      background: var(--bg-surface);
-      color: #fff;
-    }
-    .header-model-info {
-      display: flex;
-      flex-direction: column;
-    }
-    .header-model-name {
-      font-weight: 600;
-      font-size: 0.95rem;
-      color: #fff;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .header-status-pill {
-      font-size: 0.7rem;
       color: #34d399;
       display: inline-flex;
       align-items: center;
-      gap: 5px;
+      gap: 6px;
+      margin-top: 2px;
     }
     .status-dot {
       width: 7px;
@@ -818,28 +646,59 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       50% { opacity: 1; }
       100% { opacity: 0.4; }
     }
+
+    /* Header Nav Actions */
     .header-actions {
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 8px;
+      flex-wrap: wrap;
     }
-    .action-icon-btn {
+    .nav-btn {
       background: transparent;
       border: 1px solid var(--border-color);
       color: var(--text-muted);
-      padding: 6px 12px;
-      border-radius: 6px;
+      padding: 7px 12px;
+      border-radius: 7px;
       font-size: 0.8rem;
+      font-weight: 500;
       cursor: pointer;
-      display: flex;
+      display: inline-flex;
       align-items: center;
       gap: 6px;
+      text-decoration: none;
       transition: all 0.2s;
     }
-    .action-icon-btn:hover {
+    .nav-btn:hover {
+      background: var(--bg-surface);
+      color: #fff;
+      border-color: #3b82f6;
+    }
+    .nav-btn.primary {
+      background: linear-gradient(135deg, #2563eb, #4f46e5);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      color: #ffffff;
+      font-weight: 600;
+      box-shadow: 0 4px 10px rgba(37, 99, 235, 0.25);
+    }
+    .nav-btn.primary:hover {
+      background: linear-gradient(135deg, #1d4ed8, #4338ca);
+      transform: translateY(-1px);
+    }
+    .nav-btn.danger:hover {
       background: rgba(239, 68, 68, 0.1);
       border-color: rgba(239, 68, 68, 0.4);
       color: #f87171;
+    }
+
+    /* Main Chat Layout */
+    .chat-layout {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      height: calc(100vh - 65px);
+      background: var(--bg-dark);
+      position: relative;
     }
 
     /* Message Stream */
@@ -850,7 +709,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       scroll-behavior: smooth;
     }
     .chat-container {
-      max-width: 860px;
+      max-width: 880px;
       margin: 0 auto;
       display: flex;
       flex-direction: column;
@@ -955,7 +814,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       background: #334155;
     }
     .msg-body {
-      max-width: 82%;
+      max-width: 84%;
       display: flex;
       flex-direction: column;
     }
@@ -998,7 +857,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       border-bottom-left-radius: 2px;
     }
 
-    /* Markdown Styling Inside Assistant Bubble */
+    /* Markdown Inside Assistant Bubble */
     .msg-bubble p { margin-bottom: 12px; }
     .msg-bubble p:last-child { margin-bottom: 0; }
     .msg-bubble h1, .msg-bubble h2, .msg-bubble h3 {
@@ -1076,25 +935,6 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       line-height: 1.5;
     }
 
-    /* Tool Call Visualizer */
-    .tool-call-box {
-      background: rgba(139, 92, 246, 0.08);
-      border: 1px solid rgba(139, 92, 246, 0.3);
-      border-radius: 8px;
-      padding: 10px 14px;
-      margin: 12px 0;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.8rem;
-    }
-    .tool-call-badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      color: #a78bfa;
-      font-weight: 600;
-      margin-bottom: 6px;
-    }
-
     /* Telemetry Footer */
     .msg-telemetry {
       font-size: 0.7rem;
@@ -1145,11 +985,11 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
 
     /* Floating Input Dock */
     .input-dock {
-      padding: 16px 24px 22px;
+      padding: 14px 20px 20px;
       background: linear-gradient(180deg, transparent 0%, var(--bg-dark) 40%);
     }
     .input-wrapper {
-      max-width: 860px;
+      max-width: 880px;
       margin: 0 auto;
       background: #111827;
       border: 1px solid var(--border-color);
@@ -1216,99 +1056,48 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       color: var(--text-dim);
       margin-top: 8px;
     }
-
-    @media (max-width: 768px) {
-      .sidebar {
-        position: fixed;
-        left: 0;
-        top: 0;
-        bottom: 0;
-      }
-      .msg-body { max-width: 90%; }
-      .prompt-grid { grid-template-columns: 1fr; }
-    }
   </style>
 </head>
 <body>
-  <!-- Sidebar -->
-  <aside class="sidebar" id="sidebar">
-    <div>
-      <div class="sidebar-header">
-        <div class="brand-avatar">⚡</div>
-        <div>
-          <div class="brand-title">Hermes-3 8B</div>
-          <div class="brand-badge">NVIDIA A100 ZEROGPU</div>
+  <!-- Top Navigation Header -->
+  <header class="top-header">
+    <div class="brand-group">
+      <div class="brand-avatar">⚡</div>
+      <div class="brand-details">
+        <div class="brand-title">
+          <span>Hermes-3 8B</span>
+          <span class="brand-badge">NVIDIA A100 ZEROGPU</span>
+        </div>
+        <div class="status-pill">
+          <div class="status-dot"></div>
+          <span>Connected to Local In-Memory Weights</span>
         </div>
       </div>
-      <button class="new-chat-btn" id="newChatBtn">
-        <span>+</span> New Architecture Chat
+    </div>
+    <div class="header-actions">
+      <button class="nav-btn primary" id="newChatBtn">
+        <span>+</span> New Chat
       </button>
-
-      <div class="sidebar-content">
-        <div>
-          <div class="section-title">Model Parameters</div>
-          <div class="config-card">
-            <div class="config-label">
-              <span>Temperature</span>
-              <span id="tempDisplay" class="config-val">0.7</span>
-            </div>
-            <input type="range" id="tempRange" class="config-input" min="0" max="1.5" step="0.05" value="0.7">
-
-            <div class="config-label" style="margin-top: 12px;">
-              <span>Max Tokens</span>
-              <span id="tokensDisplay" class="config-val">1024</span>
-            </div>
-            <input type="range" id="tokensRange" class="config-input" min="64" max="2048" step="64" value="1024">
-          </div>
-        </div>
-
-        <div>
-          <div class="section-title">System Persona</div>
-          <textarea id="systemPromptInput" class="persona-box">You are a Lead Co-Founder & Senior Technical Architect. You possess world-class expertise in distributed systems, full-stack software engineering, and pragmatic AI engineering. Write production-ready, clean, and scalable code.</textarea>
-        </div>
-
-        <div>
-          <div class="section-title">Telemetry & Infrastructure</div>
-          <div class="telemetry-card">
-            <div class="telemetry-item"><span>Engine:</span><span class="highlight">torch.bfloat16</span></div>
-            <div class="telemetry-item"><span>GPU:</span><span class="highlight">Nvidia A100 Active</span></div>
-            <div class="telemetry-item"><span>KV Cache:</span><span class="highlight">Enabled (JIT)</span></div>
-            <div class="telemetry-item"><span>Rate Limits:</span><span class="highlight">Zero Limits</span></div>
-          </div>
-        </div>
-      </div>
+      <a href="/docs" target="_blank" class="nav-btn">
+        <span>📖</span> Docs
+      </a>
+      <a href="/v1/models" target="_blank" class="nav-btn">
+        <span>📋</span> Models
+      </a>
+      <a href="/health" target="_blank" class="nav-btn">
+        <span>💚</span> Health
+      </a>
+      <a href="/gradio" target="_blank" class="nav-btn">
+        <span>⚡</span> Gradio
+      </a>
+      <button class="nav-btn danger" id="clearChatBtn" title="Clear Chat">
+        <span>🗑️</span> Clear
+      </button>
     </div>
-
-    <div class="sidebar-footer">
-      <a href="/docs" target="_blank" class="quick-link">📖 Swagger API Docs</a>
-      <a href="/v1/models" target="_blank" class="quick-link">📋 Models Catalog</a>
-      <a href="/health" target="_blank" class="quick-link">💚 Health & Diagnostics</a>
-      <a href="/gradio" target="_blank" class="quick-link">⚡ Gradio Interface</a>
-    </div>
-  </aside>
+  </header>
 
   <!-- Main Chat Layout -->
   <main class="chat-layout">
-    <header class="chat-header">
-      <div class="header-left">
-        <button class="menu-toggle-btn" id="toggleSidebarBtn" title="Toggle Sidebar">☰</button>
-        <div class="header-model-info">
-          <div class="header-model-name">
-            NousResearch/Hermes-3-Llama-3.1-8B
-          </div>
-          <div class="header-status-pill">
-            <div class="status-dot"></div>
-            <span>Connected to Local In-Memory Weights</span>
-          </div>
-        </div>
-      </div>
-      <div class="header-actions">
-        <button class="action-icon-btn" id="clearChatBtn" title="Clear Chat">
-          <span>🗑️</span> Clear
-        </button>
-      </div>
-    </header>
-
     <!-- Scrollable Messages Container -->
     <div class="chat-scroll" id="chatScroll">
       <div class="chat-container" id="chatContainer">
@@ -1378,13 +1167,6 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
     const heroWelcome = document.getElementById("heroWelcome");
     const newChatBtn = document.getElementById("newChatBtn");
     const clearChatBtn = document.getElementById("clearChatBtn");
-    const toggleSidebarBtn = document.getElementById("toggleSidebarBtn");
-    const sidebar = document.getElementById("sidebar");
-    const tempRange = document.getElementById("tempRange");
-    const tempDisplay = document.getElementById("tempDisplay");
-    const tokensRange = document.getElementById("tokensRange");
-    const tokensDisplay = document.getElementById("tokensDisplay");
-    const systemPromptInput = document.getElementById("systemPromptInput");
 
     // Configure Marked
     marked.setOptions({
@@ -1429,15 +1211,6 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       }
     };
 
-    // Range Sliders
-    tempRange.addEventListener("input", (e) => tempDisplay.textContent = e.target.value);
-    tokensRange.addEventListener("input", (e) => tokensDisplay.textContent = e.target.value);
-
-    // Sidebar Toggle
-    toggleSidebarBtn.addEventListener("click", () => {
-      sidebar.classList.toggle("closed");
-    });
-
     // Textarea Auto-Resize
     chatInput.addEventListener("input", function() {
       this.style.height = 'auto';
@@ -1462,8 +1235,8 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       }
     });
 
-    newChatBtn.addEventListener("click", resetChat);
-    clearChatBtn.addEventListener("click", resetChat);
+    if (newChatBtn) newChatBtn.addEventListener("click", resetChat);
+    if (clearChatBtn) clearChatBtn.addEventListener("click", resetChat);
 
     function resetChat() {
       if (isGenerating && abortController) abortController.abort();
@@ -1513,11 +1286,11 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
         const payload = {
           model: "NousResearch/Hermes-3-Llama-3.1-8B",
           messages: [
-            { role: "system", content: systemPromptInput.value.trim() },
+            { role: "system", content: "You are a Lead Co-Founder & Senior Technical Architect. You possess world-class expertise in distributed systems, full-stack software engineering, and pragmatic AI engineering. Write production-ready, clean, scalable, and secure code." },
             ...conversation
           ],
-          temperature: parseFloat(tempRange.value),
-          max_tokens: parseInt(tokensRange.value),
+          temperature: 0.7,
+          max_tokens: 1024,
           stream: true
         };
 
