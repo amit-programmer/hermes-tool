@@ -337,7 +337,7 @@ async def health_check():
             pass
 
     return {
-        "status": "healthy" if model is not None else ("loading" if is_model_loading else "error"),
+        "status": "healthy" if model is not None else ("loading" if is_model_loading else "ready_to_load"),
         "service": "Hermes-3 8B Local Server",
         "model": MODEL_ID,
         "is_model_loaded": model is not None,
@@ -351,14 +351,13 @@ async def health_check():
 @app.get("/v1/models")
 async def list_models():
     """OpenAI-compatible models catalog endpoint."""
-    models = [
-        ModelCard(id=MODEL_ID),
-        ModelCard(id="Hermes-3-8B"),
-        ModelCard(id="NousResearch/Hermes-3-Llama-3.1-8B")
-    ]
     return {
         "object": "list",
-        "data": [m.model_dump() for m in models]
+        "data": [
+            {"id": MODEL_ID, "object": "model", "created": int(START_TIME), "owned_by": "NousResearch"},
+            {"id": "Hermes-3-8B", "object": "model", "created": int(START_TIME), "owned_by": "NousResearch"},
+            {"id": "NousResearch/Hermes-3-Llama-3.1-8B", "object": "model", "created": int(START_TIME), "owned_by": "NousResearch"}
+        ]
     }
 
 @app.api_route("/v1/warmup", methods=["GET", "POST"])
