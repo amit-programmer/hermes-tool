@@ -230,9 +230,8 @@ def sanitize_assistant_output(raw_text: str) -> str:
     cleaned = raw_text.replace("<|im_end|>", "").rstrip()
     return cleaned
 
-# --- Local Generation Functions ---
-@spaces.GPU(duration=120)
-def generate_local(prompt_text: str, max_tokens: int, temperature: float, top_p: float) -> str:
+# --- Core Generation Function ---
+def _generate_core(prompt_text: str, max_tokens: int, temperature: float, top_p: float) -> str:
     """Generates complete text response directly using the locally loaded model weights."""
     if model is None or tokenizer is None:
         load_local_model()
@@ -255,6 +254,12 @@ def generate_local(prompt_text: str, max_tokens: int, temperature: float, top_p:
     # skip_special_tokens=False is necessary so agentic <tool_call> tags are never stripped
     raw_output = tokenizer.decode(generated_tokens, skip_special_tokens=False)
     return sanitize_assistant_output(raw_output)
+
+# --- Generation with ZeroGPU Decorators ---
+@spaces.GPU(duration=120)
+def generate_local(prompt_text: str, max_tokens: int, temperature: float, top_p: float) -> str:
+    """Entrypoint for FastAPI inference requests on ZeroGPU."""
+    return _generate_core(prompt_text, max_tokens, temperature, top_p)
 
 @spaces.GPU(duration=120)
 def stream_local_tokens(prompt_text: str, max_tokens: int, temperature: float, top_p: float):
@@ -488,6 +493,7 @@ async def chat_completions(req: ChatCompletionRequest):
 try:
     import gradio as gr
 
+    @spaces.GPU(duration=120)
     def gradio_chat_fn(user_message, history):
         if not user_message:
             return ""
@@ -506,7 +512,7 @@ try:
 
         prompt = construct_chatml_prompt(conversation)
         try:
-            return generate_local(prompt, 1024, 0.7, 0.95)
+            return _generate_core(prompt, 1024, 0.7, 0.95)
         except Exception as e:
             return f"❌ Error: {str(e)}"
 
