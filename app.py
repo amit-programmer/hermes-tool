@@ -49,6 +49,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("HermesLocalServer")
 
+# --- Top-Level ZeroGPU Startup Inspector Function ---
+@spaces.GPU
+def _zerogpu_startup():
+    """Satisfies ZeroGPU startup inspector check."""
+    pass
+
 # --- Configuration ---
 MODEL_ID = os.getenv("MODEL_ID", "NousResearch/Hermes-3-Llama-3.1-8B")
 HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HF_ACCESS_TOKEN")
@@ -577,4 +583,4 @@ if __name__ == "__main__":
         pass
 
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=7860, reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=7860)
