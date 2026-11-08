@@ -27,7 +27,7 @@ try:
     print("Hugging Face ZeroGPU environment detected.", flush=True)
 except Exception as e:
     HAS_SPACES = False
-    print(f"FAILED TO IMPORT SPACES: {type(e).__name__}: {e}", flush=True)
+    print(f"ZeroGPU not detected or failed to import: {type(e).__name__}: {e}", flush=True)
 
     # Mock spaces.GPU decorator for local execution
     class spaces:
@@ -43,7 +43,6 @@ import torch
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
-    BitsAndBytesConfig,
     TextIteratorStreamer
 )
 from fastapi import FastAPI, HTTPException, Request
@@ -78,7 +77,6 @@ HF_SPACE_URL = (
 ).rstrip("/")
 
 START_TIME = time.time()
-active_requests_count = 0
 
 # --- Default Hardened Persona ---
 DEFAULT_SYSTEM_PROMPT = (
@@ -103,11 +101,28 @@ model = None
 is_model_loading = False
 model_load_error = None
 
+def get_eos_token_ids(tok) -> List[int]:
+    """Retrieves all stop token IDs for Hermes-3 / Llama 3.1."""
+    stop_ids = set()
+    if tok.eos_token_id is not None:
+        if isinstance(tok.eos_token_id, list):
+            stop_ids.update(tok.eos_token_id)
+        else:
+            stop_ids.add(tok.eos_token_id)
+    # Crucial Hermes-3 & Llama 3.1 stop tokens
+    for token_str in ["<|im_end|>", "<|eot_id|>", "<|end_of_text|>"]:
+        try:
+            tid = tok.convert_tokens_to_ids(token_str)
+            if tid is not None and isinstance(tid, int) and tid > 0:
+                stop_ids.add(tid)
+        except Exception:
+            pass
+    return list(stop_ids)
+
 def load_local_model():
     """
-    Downloads and loads the model and tokenizer into memory on startup.
-    Uses 4-bit BitsAndBytes quantization when CUDA is available (~5.5GB VRAM),
-    or optimized float32/bfloat16 on CPU.
+    Downloads and loads the model and tokenizer into memory.
+    Uses native bfloat16 on CUDA / ZeroGPU for maximum Tensor Core throughput.
     """
     global tokenizer, model, is_model_loading, model_load_error
     if model is not None:
@@ -125,39 +140,21 @@ def load_local_model():
             tokenizer.pad_token = tokenizer.eos_token
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"2. Target device detected: {device.upper()}")
+        logger.info(f"2. Target device detected: {device.upper()} (ZeroGPU: {HAS_SPACES})")
 
-        # If CUDA / ZeroGPU is available, load with 4-bit quantization for high speed & low VRAM
-        if device == "cuda":
-            logger.info("   Mounting model with 4-bit BitsAndBytes NF4 quantization (~5.5GB VRAM)...")
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16
-            )
-            model = AutoModelForCausalLM.from_pretrained(
-                MODEL_ID,
-                token=HF_TOKEN,
-                quantization_config=bnb_config,
-                device_map="auto",
-                low_cpu_mem_usage=True,
-                trust_remote_code=True
-            )
-        else:
-            # CPU Fallback: Load weights directly into system RAM
-            logger.info("   Mounting model in CPU mode (low_cpu_mem_usage=True)...")
-            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
-            model = AutoModelForCausalLM.from_pretrained(
-                MODEL_ID,
-                token=HF_TOKEN,
-                torch_dtype=dtype,
-                device_map="auto",
-                low_cpu_mem_usage=True,
-                trust_remote_code=True
-            )
+        # Use native bfloat16 for fast execution without 4-bit dequantization overhead
+        dtype = torch.bfloat16 if (torch.cuda.is_available() or HAS_SPACES or torch.cuda.is_bf16_supported()) else torch.float32
+        logger.info(f"   Mounting model with native dtype: {dtype}...")
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_ID,
+            token=HF_TOKEN,
+            torch_dtype=dtype,
+            device_map="auto",
+            low_cpu_mem_usage=True,
+            trust_remote_code=True
+        )
 
-        logger.info(f"3. Model '{MODEL_ID}' successfully loaded into memory! Ready for unlimited local inference.")
+        logger.info(f"3. Model '{MODEL_ID}' successfully loaded into memory! Ready for ultra-low latency inference.")
         is_model_loading = False
         return model, tokenizer
 
@@ -171,7 +168,7 @@ def load_local_model():
 app = FastAPI(
     title="Hermes-3 8B Local API Server",
     description="Standalone OpenAI-compatible inference server running Hermes-3 8B locally with zero external API limits.",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 # Enable CORS for external bot & web access
@@ -246,7 +243,12 @@ def sanitize_assistant_output(raw_text: str) -> str:
     Cleans Hermes stop tokens (<|im_end|>) while preserving
     any tool calling tags (<tool_call>, </tool_call>) and agentic structure.
     """
-    cleaned = raw_text.replace("<|im_end|>", "").rstrip()
+    cleaned = (
+        raw_text.replace("<|im_end|>", "")
+        .replace("<|eot_id|>", "")
+        .replace("<|end_of_text|>", "")
+        .rstrip()
+    )
     return cleaned
 
 # --- Core Generation Function ---
@@ -257,6 +259,7 @@ def _generate_core(prompt_text: str, max_tokens: int, temperature: float, top_p:
 
     device = model.device
     inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+    stop_ids = get_eos_token_ids(tokenizer)
 
     with torch.no_grad():
         outputs = model.generate(
@@ -265,12 +268,12 @@ def _generate_core(prompt_text: str, max_tokens: int, temperature: float, top_p:
             temperature=max(temperature, 0.01),
             top_p=top_p,
             do_sample=True if temperature > 0.0 else False,
+            use_cache=True,
             pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id
+            eos_token_id=stop_ids
         )
 
     generated_tokens = outputs[0][inputs.input_ids.shape[-1]:]
-    # skip_special_tokens=False is necessary so agentic <tool_call> tags are never stripped
     raw_output = tokenizer.decode(generated_tokens, skip_special_tokens=False)
     return sanitize_assistant_output(raw_output)
 
@@ -288,11 +291,13 @@ def stream_local_tokens(prompt_text: str, max_tokens: int, temperature: float, t
 
     device = model.device
     inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+    stop_ids = get_eos_token_ids(tokenizer)
 
     streamer = TextIteratorStreamer(
         tokenizer,
         skip_prompt=True,
-        skip_special_tokens=False
+        skip_special_tokens=False,
+        timeout=60.0
     )
 
     generation_kwargs = dict(
@@ -302,19 +307,25 @@ def stream_local_tokens(prompt_text: str, max_tokens: int, temperature: float, t
         temperature=max(temperature, 0.01),
         top_p=top_p,
         do_sample=True if temperature > 0.0 else False,
+        use_cache=True,
         pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id
+        eos_token_id=stop_ids
     )
 
-    # Run generation in background thread so streamer yields without blocking
     thread = Thread(target=model.generate, kwargs=generation_kwargs)
     thread.start()
 
+    stop_tokens = ["<|im_end|>", "<|eot_id|>", "<|end_of_text|>"]
     for new_text in streamer:
-        if "<|im_end|>" in new_text:
-            cleaned_text = new_text.replace("<|im_end|>", "")
-            if cleaned_text:
-                yield cleaned_text
+        has_stop = False
+        for st in stop_tokens:
+            if st in new_text:
+                cleaned = new_text.replace(st, "")
+                if cleaned:
+                    yield cleaned
+                has_stop = True
+                break
+        if has_stop:
             break
         yield new_text
 
@@ -322,8 +333,22 @@ def stream_local_tokens(prompt_text: str, max_tokens: int, temperature: float, t
 
 @app.on_event("startup")
 async def startup_event():
-    """Fast server startup without blocking event loop."""
-    logger.info("Hermes-3 8B Local API Server started and ready for requests.")
+    """Fast server startup with background model preloader and JIT warmup."""
+    logger.info("Hermes-3 8B Local API Server initialized.")
+    def _preload_and_warm():
+        try:
+            logger.info("Background preloading model into memory...")
+            load_local_model()
+            logger.info("Background model loading complete! Pre-warming JIT kernels...")
+            try:
+                generate_local("<|im_start|>user\nping<|im_end|>\n<|im_start|>assistant\n", 2, 0.5, 0.9)
+                logger.info("JIT kernels pre-warmed successfully!")
+            except Exception as w_err:
+                logger.warning(f"Startup warmup note: {w_err}")
+        except Exception as e:
+            logger.warning(f"Background preload note: {e}")
+
+    Thread(target=_preload_and_warm, daemon=True).start()
 
 @app.get("/health")
 async def health_check():
@@ -511,302 +536,984 @@ async def all_exception_handler(request: Request, exc: Exception):
         content={"detail": "Internal Server Error", "error": str(exc), "path": request.url.path}
     )
 
-# --- Interactive Web Chatbot Playground (HTML + Vanilla JS) ---
+# --- Professional Interactive Web Chatbot Playground (HTML5 + CSS3 + Vanilla JS) ---
 HTML_PLAYGROUND = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Hermes-3 8B | Local In-Memory Playground</title>
+  <title>Hermes-3 8B | Enterprise AI Architect</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <!-- Markdown & Syntax Highlighting -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <style>
+    :root {
+      --bg-dark: #090d16;
+      --bg-card: #111827;
+      --bg-surface: #1e293b;
+      --border-color: #27354a;
+      --border-hover: #3b82f6;
+      --primary: #3b82f6;
+      --primary-hover: #2563eb;
+      --accent: #8b5cf6;
+      --accent-glow: rgba(139, 92, 246, 0.25);
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+      --success: #10b981;
+    }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      background: #0f172a;
-      color: #f8fafc;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg-dark);
+      color: var(--text-main);
+      display: flex;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* Sidebar */
+    .sidebar {
+      width: 300px;
+      background: #0d1322;
+      border-right: 1px solid var(--border-color);
       display: flex;
       flex-direction: column;
-      height: 100vh;
+      justify-content: space-between;
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      z-index: 50;
     }
-    header {
-      background: #1e293b;
-      padding: 14px 24px;
-      border-bottom: 1px solid #334155;
+    .sidebar.closed {
+      margin-left: -300px;
+    }
+    .sidebar-header {
+      padding: 18px 20px;
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .brand-avatar {
+      width: 38px;
+      height: 38px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.25rem;
+      box-shadow: 0 0 15px var(--accent-glow);
+    }
+    .brand-title {
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: #fff;
+    }
+    .brand-badge {
+      font-size: 0.65rem;
+      color: #38bdf8;
+      background: rgba(56, 189, 248, 0.12);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-weight: 600;
+      margin-top: 2px;
+      display: inline-block;
+    }
+    .new-chat-btn {
+      margin: 16px;
+      background: linear-gradient(135deg, #2563eb, #4f46e5);
+      color: #ffffff;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      padding: 10px 16px;
+      border-radius: 8px;
+      font-size: 0.88rem;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      cursor: pointer;
+      box-shadow: 0 4px 12px rgba(37, 99, 235, 0.25);
+      transition: all 0.2s;
+    }
+    .new-chat-btn:hover {
+      background: linear-gradient(135deg, #1d4ed8, #4338ca);
+      transform: translateY(-1px);
+    }
+    .sidebar-content {
+      flex: 1;
+      padding: 0 16px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .section-title {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-dim);
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+    .config-card {
+      background: rgba(30, 41, 59, 0.5);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 14px;
+    }
+    .config-label {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      margin-bottom: 6px;
       display: flex;
       justify-content: space-between;
       align-items: center;
-      flex-wrap: wrap;
+    }
+    .config-val {
+      color: #38bdf8;
+      font-weight: 600;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .config-input {
+      width: 100%;
+      accent-color: var(--primary);
+      cursor: pointer;
+    }
+    .persona-box {
+      width: 100%;
+      height: 90px;
+      background: #090d16;
+      border: 1px solid var(--border-color);
+      color: #cbd5e1;
+      padding: 8px 10px;
+      border-radius: 6px;
+      font-size: 0.76rem;
+      line-height: 1.4;
+      resize: vertical;
+      font-family: inherit;
+      outline: none;
+    }
+    .persona-box:focus { border-color: var(--primary); }
+
+    /* Telemetry Card */
+    .telemetry-card {
+      background: rgba(16, 185, 129, 0.05);
+      border: 1px solid rgba(16, 185, 129, 0.2);
+      border-radius: 8px;
+      padding: 12px;
+      font-size: 0.76rem;
+    }
+    .telemetry-item {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 4px;
+      color: var(--text-muted);
+    }
+    .telemetry-item span.highlight {
+      color: #34d399;
+      font-weight: 600;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    /* Sidebar Footer Links */
+    .sidebar-footer {
+      padding: 16px;
+      border-top: 1px solid var(--border-color);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .quick-link {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 0.82rem;
+      padding: 7px 10px;
+      border-radius: 6px;
+      transition: all 0.2s;
+    }
+    .quick-link:hover {
+      background: rgba(59, 130, 246, 0.1);
+      color: #fff;
+    }
+
+    /* Main Chat Area */
+    .chat-layout {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      background: var(--bg-dark);
+      position: relative;
+    }
+    .chat-header {
+      padding: 14px 24px;
+      background: #0d1322;
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      z-index: 10;
+    }
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .menu-toggle-btn {
+      background: transparent;
+      border: 1px solid var(--border-color);
+      color: var(--text-muted);
+      width: 34px;
+      height: 34px;
+      border-radius: 6px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1rem;
+      transition: all 0.2s;
+    }
+    .menu-toggle-btn:hover {
+      background: var(--bg-surface);
+      color: #fff;
+    }
+    .header-model-info {
+      display: flex;
+      flex-direction: column;
+    }
+    .header-model-name {
+      font-weight: 600;
+      font-size: 0.95rem;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .header-status-pill {
+      font-size: 0.7rem;
+      color: #34d399;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #10b981;
+      box-shadow: 0 0 8px #10b981;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0% { opacity: 0.4; }
+      50% { opacity: 1; }
+      100% { opacity: 0.4; }
+    }
+    .header-actions {
+      display: flex;
+      align-items: center;
       gap: 10px;
     }
-    .header-left { display: flex; align-items: center; gap: 12px; }
-    .title { font-size: 1.15rem; font-weight: 700; color: #38bdf8; }
-    .badge {
-      background: #065f46;
-      color: #34d399;
-      font-size: 0.75rem;
-      padding: 4px 10px;
-      border-radius: 9999px;
+    .action-icon-btn {
+      background: transparent;
+      border: 1px solid var(--border-color);
+      color: var(--text-muted);
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.2s;
+    }
+    .action-icon-btn:hover {
+      background: rgba(239, 68, 68, 0.1);
+      border-color: rgba(239, 68, 68, 0.4);
+      color: #f87171;
+    }
+
+    /* Message Stream */
+    .chat-scroll {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px 16px;
+      scroll-behavior: smooth;
+    }
+    .chat-container {
+      max-width: 860px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 22px;
+    }
+
+    /* Welcome Hero */
+    .hero-container {
+      text-align: center;
+      padding: 40px 20px 20px;
+      animation: fadeIn 0.4s ease-out;
+    }
+    .hero-orb {
+      width: 64px;
+      height: 64px;
+      margin: 0 auto 18px;
+      border-radius: 20px;
+      background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 2rem;
+      box-shadow: 0 0 30px rgba(99, 102, 241, 0.4);
+    }
+    .hero-title {
+      font-size: 1.6rem;
+      font-weight: 700;
+      color: #fff;
+      margin-bottom: 8px;
+      letter-spacing: -0.02em;
+    }
+    .hero-subtitle {
+      font-size: 0.92rem;
+      color: var(--text-muted);
+      max-width: 520px;
+      margin: 0 auto 30px;
+      line-height: 1.5;
+    }
+    .prompt-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 12px;
+      text-align: left;
+    }
+    .prompt-card {
+      background: #111827;
+      border: 1px solid var(--border-color);
+      padding: 14px 16px;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .prompt-card:hover {
+      border-color: var(--border-hover);
+      transform: translateY(-2px);
+      box-shadow: 0 4px 14px rgba(59, 130, 246, 0.15);
+    }
+    .prompt-card-icon {
+      font-size: 1.2rem;
+      margin-bottom: 6px;
+    }
+    .prompt-card-title {
+      font-size: 0.88rem;
       font-weight: 600;
-      display: inline-flex;
+      color: #f1f5f9;
+      margin-bottom: 4px;
+    }
+    .prompt-card-desc {
+      font-size: 0.78rem;
+      color: var(--text-dim);
+      line-height: 1.35;
+    }
+
+    /* Message Bubbles */
+    .message-row {
+      display: flex;
+      gap: 14px;
+      animation: messageSlide 0.25s ease-out;
+    }
+    @keyframes messageSlide {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .message-row.user {
+      justify-content: flex-end;
+    }
+    .msg-avatar {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1rem;
+    }
+    .msg-avatar.assistant {
+      background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+      box-shadow: 0 0 10px var(--accent-glow);
+    }
+    .msg-avatar.user {
+      background: #334155;
+    }
+    .msg-body {
+      max-width: 82%;
+      display: flex;
+      flex-direction: column;
+    }
+    .message-row.user .msg-body {
+      align-items: flex-end;
+    }
+    .msg-header {
+      font-size: 0.76rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+      display: flex;
       align-items: center;
       gap: 6px;
     }
-    .badge::before {
-      content: "";
-      width: 8px;
-      height: 8px;
-      background: #10b981;
-      border-radius: 50%;
-      display: inline-block;
+    .architect-tag {
+      background: rgba(59, 130, 246, 0.15);
+      color: #60a5fa;
+      font-size: 0.68rem;
+      padding: 1px 6px;
+      border-radius: 4px;
     }
-    .header-links a {
-      color: #94a3b8;
-      text-decoration: none;
-      font-size: 0.85rem;
-      margin-left: 14px;
-      padding: 6px 10px;
-      border-radius: 6px;
-      background: #334155;
-      transition: all 0.2s;
-    }
-    .header-links a:hover { color: #f8fafc; background: #475569; }
-    .container {
-      display: flex;
-      flex: 1;
-      overflow: hidden;
-    }
-    .sidebar {
-      width: 320px;
-      background: #1e293b;
-      border-right: 1px solid #334155;
-      padding: 18px;
-      display: flex;
-      flex-direction: column;
-      gap: 16px;
-      overflow-y: auto;
-    }
-    .sidebar h3 { font-size: 0.9rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; }
-    .sidebar label { font-size: 0.82rem; color: #cbd5e1; display: block; margin-bottom: 6px; }
-    .sidebar textarea, .sidebar input[type="range"] {
-      width: 100%;
-    }
-    .sidebar textarea {
-      background: #0f172a;
-      border: 1px solid #334155;
-      color: #f8fafc;
-      padding: 10px;
-      border-radius: 6px;
-      font-size: 0.8rem;
-      resize: vertical;
-      font-family: inherit;
-      line-height: 1.4;
-      height: 130px;
-    }
-    .range-val { font-size: 0.8rem; color: #38bdf8; font-weight: 600; float: right; }
-    .clear-btn {
-      background: #ef444422;
-      border: 1px solid #ef444455;
-      color: #f87171;
-      padding: 8px 14px;
-      border-radius: 6px;
-      cursor: pointer;
-      font-size: 0.85rem;
-      font-weight: 600;
-      transition: all 0.2s;
-    }
-    .clear-btn:hover { background: #ef444444; }
-    .chat-area {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      background: #0f172a;
-      overflow: hidden;
-    }
-    .messages-container {
-      flex: 1;
-      overflow-y: auto;
-      padding: 24px;
-      display: flex;
-      flex-direction: column;
-      gap: 16px;
-    }
-    .message {
-      max-width: 80%;
+    .msg-bubble {
       padding: 14px 18px;
       border-radius: 12px;
-      line-height: 1.55;
-      font-size: 0.95rem;
+      font-size: 0.94rem;
+      line-height: 1.6;
       word-break: break-word;
-      white-space: pre-wrap;
     }
-    .user-msg {
-      align-self: flex-end;
+    .message-row.user .msg-bubble {
       background: #2563eb;
       color: #ffffff;
       border-bottom-right-radius: 2px;
+      white-space: pre-wrap;
     }
-    .assistant-msg {
-      align-self: flex-start;
-      background: #1e293b;
-      color: #f1f5f9;
-      border: 1px solid #334155;
+    .message-row.assistant .msg-bubble {
+      background: #111827;
+      border: 1px solid var(--border-color);
+      color: #e2e8f0;
       border-bottom-left-radius: 2px;
     }
-    .msg-meta {
-      font-size: 0.72rem;
+
+    /* Markdown Styling Inside Assistant Bubble */
+    .msg-bubble p { margin-bottom: 12px; }
+    .msg-bubble p:last-child { margin-bottom: 0; }
+    .msg-bubble h1, .msg-bubble h2, .msg-bubble h3 {
+      color: #fff;
+      margin: 16px 0 8px;
+      font-weight: 600;
+    }
+    .msg-bubble h1 { font-size: 1.25rem; }
+    .msg-bubble h2 { font-size: 1.1rem; }
+    .msg-bubble h3 { font-size: 1.0rem; }
+    .msg-bubble ul, .msg-bubble ol {
+      margin-left: 20px;
+      margin-bottom: 12px;
+    }
+    .msg-bubble li { margin-bottom: 4px; }
+    .msg-bubble blockquote {
+      border-left: 3px solid var(--primary);
+      padding-left: 12px;
+      color: var(--text-muted);
+      margin: 12px 0;
+      font-style: italic;
+    }
+    .msg-bubble code {
+      background: rgba(255, 255, 255, 0.08);
+      font-family: 'JetBrains Mono', monospace;
+      padding: 2px 5px;
+      border-radius: 4px;
+      font-size: 0.86rem;
+      color: #f43f5e;
+    }
+
+    /* Code Blocks */
+    .code-block-wrapper {
+      position: relative;
+      margin: 14px 0;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid #334155;
+      background: #0f172a;
+    }
+    .code-block-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: #1e293b;
+      padding: 6px 14px;
+      font-size: 0.75rem;
       color: #94a3b8;
+      font-family: 'JetBrains Mono', monospace;
+      border-bottom: 1px solid #334155;
+    }
+    .copy-btn {
+      background: transparent;
+      border: none;
+      color: #cbd5e1;
+      font-size: 0.72rem;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      transition: color 0.2s;
+    }
+    .copy-btn:hover { color: #38bdf8; }
+    .code-block-wrapper pre {
+      margin: 0;
+      padding: 14px;
+      overflow-x: auto;
+    }
+    .code-block-wrapper pre code {
+      background: transparent !important;
+      padding: 0 !important;
+      color: inherit;
+      font-size: 0.85rem;
+      font-family: 'JetBrains Mono', monospace;
+      line-height: 1.5;
+    }
+
+    /* Tool Call Visualizer */
+    .tool-call-box {
+      background: rgba(139, 92, 246, 0.08);
+      border: 1px solid rgba(139, 92, 246, 0.3);
+      border-radius: 8px;
+      padding: 10px 14px;
+      margin: 12px 0;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+    }
+    .tool-call-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: #a78bfa;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+
+    /* Telemetry Footer */
+    .msg-telemetry {
+      font-size: 0.7rem;
+      color: var(--text-dim);
       margin-top: 6px;
       display: flex;
       align-items: center;
-      gap: 6px;
+      gap: 8px;
+      font-family: 'JetBrains Mono', monospace;
     }
-    .input-bar {
-      padding: 16px 24px;
-      background: #1e293b;
-      border-top: 1px solid #334155;
+
+    /* Typing Dots */
+    .thinking-box {
       display: flex;
-      gap: 12px;
-      align-items: flex-end;
+      align-items: center;
+      gap: 8px;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      padding: 6px 0;
     }
-    .input-bar textarea {
+    .typing-dots span {
+      display: inline-block;
+      width: 6px;
+      height: 6px;
+      background: #60a5fa;
+      border-radius: 50%;
+      margin-right: 3px;
+      animation: bounce 1.2s infinite ease-in-out;
+    }
+    .typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+    .typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes bounce {
+      0%, 80%, 100% { transform: scale(0); opacity: 0.4; }
+      40% { transform: scale(1); opacity: 1; }
+    }
+
+    /* Live Cursor */
+    .streaming-cursor {
+      display: inline-block;
+      width: 7px;
+      height: 14px;
+      background: #38bdf8;
+      margin-left: 2px;
+      animation: blink 0.9s infinite;
+      vertical-align: middle;
+    }
+    @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
+
+    /* Floating Input Dock */
+    .input-dock {
+      padding: 16px 24px 22px;
+      background: linear-gradient(180deg, transparent 0%, var(--bg-dark) 40%);
+    }
+    .input-wrapper {
+      max-width: 860px;
+      margin: 0 auto;
+      background: #111827;
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      padding: 10px 14px;
+      display: flex;
+      align-items: flex-end;
+      gap: 10px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+      transition: border-color 0.2s;
+    }
+    .input-wrapper:focus-within {
+      border-color: var(--border-hover);
+      box-shadow: 0 8px 24px rgba(59, 130, 246, 0.15);
+    }
+    .chat-textarea {
       flex: 1;
-      background: #0f172a;
-      border: 1px solid #334155;
+      background: transparent;
+      border: none;
       color: #f8fafc;
-      padding: 12px 16px;
-      border-radius: 8px;
       font-size: 0.95rem;
       font-family: inherit;
       resize: none;
-      height: 48px;
-      max-height: 140px;
-      line-height: 1.4;
+      height: 38px;
+      max-height: 160px;
+      line-height: 1.45;
       outline: none;
+      padding: 6px 4px;
     }
-    .input-bar textarea:focus { border-color: #38bdf8; }
-    .send-btn {
-      background: #0284c7;
+    .chat-textarea::placeholder { color: var(--text-dim); }
+    .send-action-btn {
+      width: 38px;
+      height: 38px;
+      border-radius: 8px;
+      background: var(--primary);
       color: white;
       border: none;
-      padding: 12px 22px;
-      border-radius: 8px;
-      font-weight: 600;
       cursor: pointer;
-      font-size: 0.95rem;
-      height: 48px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.1rem;
       transition: all 0.2s;
+      flex-shrink: 0;
     }
-    .send-btn:hover:not(:disabled) { background: #0369a1; }
-    .send-btn:disabled { background: #475569; cursor: not-allowed; }
+    .send-action-btn:hover:not(:disabled) {
+      background: var(--primary-hover);
+      transform: scale(1.03);
+    }
+    .send-action-btn:disabled {
+      background: #1e293b;
+      color: #475569;
+      cursor: not-allowed;
+    }
+    .send-action-btn.stop {
+      background: #ef4444;
+    }
+    .send-action-btn.stop:hover {
+      background: #dc2626;
+    }
+    .input-hint {
+      text-align: center;
+      font-size: 0.72rem;
+      color: var(--text-dim);
+      margin-top: 8px;
+    }
+
     @media (max-width: 768px) {
-      .sidebar { display: none; }
-      .message { max-width: 95%; }
+      .sidebar {
+        position: fixed;
+        left: 0;
+        top: 0;
+        bottom: 0;
+      }
+      .msg-body { max-width: 90%; }
+      .prompt-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
 <body>
-  <header>
-    <div class="header-left">
-      <div class="title">🚀 Hermes-3 8B Playground</div>
-      <span class="badge">ZeroGPU Nvidia A100 Active</span>
-    </div>
-    <div class="header-links">
-      <a href="/docs" target="_blank">📖 Swagger Docs</a>
-      <a href="/v1/models" target="_blank">📋 Models API</a>
-      <a href="/health" target="_blank">💚 Health</a>
-      <a href="/gradio" target="_blank">⚡ Gradio UI</a>
-    </div>
-  </header>
-  <div class="container">
-    <aside class="sidebar">
-      <h3>⚙️ Configuration</h3>
-      <div>
-        <label>System Persona</label>
-        <textarea id="sysPrompt">You are a Lead Co-Founder & Senior Technical Architect. You possess world-class expertise in distributed systems, full-stack software engineering, and pragmatic AI engineering. Write production-ready, clean, and scalable solutions.</textarea>
-      </div>
-      <div>
-        <label>Temperature: <span id="tempVal" class="range-val">0.7</span></label>
-        <input type="range" id="tempRange" min="0" max="1.5" step="0.05" value="0.7">
-      </div>
-      <div>
-        <label>Max Tokens: <span id="tokensVal" class="range-val">512</span></label>
-        <input type="range" id="tokensRange" min="64" max="2048" step="64" value="512">
-      </div>
-      <button class="clear-btn" id="clearBtn">🗑️ Clear Chat History</button>
-    </aside>
-    <main class="chat-area">
-      <div class="messages-container" id="messagesContainer">
-        <div class="message assistant-msg">
-          <strong>Lead Architect:</strong><br>
-          Hello! I am your Hermes-3 8B AI Co-Founder & Senior Architect running directly in GPU memory on this Hugging Face Space with zero external API rate limits.<br><br>
-          How can I help you architect, code, or debug your system today?
-          <div class="msg-meta">System Ready</div>
+  <!-- Sidebar -->
+  <aside class="sidebar" id="sidebar">
+    <div>
+      <div class="sidebar-header">
+        <div class="brand-avatar">⚡</div>
+        <div>
+          <div class="brand-title">Hermes-3 8B</div>
+          <div class="brand-badge">NVIDIA A100 ZEROGPU</div>
         </div>
       </div>
-      <div class="input-bar">
-        <textarea id="userInput" placeholder="Ask a question or request code... (Shift+Enter for newline)"></textarea>
-        <button id="sendBtn" class="send-btn">Send</button>
+      <button class="new-chat-btn" id="newChatBtn">
+        <span>+</span> New Architecture Chat
+      </button>
+
+      <div class="sidebar-content">
+        <div>
+          <div class="section-title">Model Parameters</div>
+          <div class="config-card">
+            <div class="config-label">
+              <span>Temperature</span>
+              <span id="tempDisplay" class="config-val">0.7</span>
+            </div>
+            <input type="range" id="tempRange" class="config-input" min="0" max="1.5" step="0.05" value="0.7">
+
+            <div class="config-label" style="margin-top: 12px;">
+              <span>Max Tokens</span>
+              <span id="tokensDisplay" class="config-val">1024</span>
+            </div>
+            <input type="range" id="tokensRange" class="config-input" min="64" max="2048" step="64" value="1024">
+          </div>
+        </div>
+
+        <div>
+          <div class="section-title">System Persona</div>
+          <textarea id="systemPromptInput" class="persona-box">You are a Lead Co-Founder & Senior Technical Architect. You possess world-class expertise in distributed systems, full-stack software engineering, and pragmatic AI engineering. Write production-ready, clean, and scalable code.</textarea>
+        </div>
+
+        <div>
+          <div class="section-title">Telemetry & Infrastructure</div>
+          <div class="telemetry-card">
+            <div class="telemetry-item"><span>Engine:</span><span class="highlight">torch.bfloat16</span></div>
+            <div class="telemetry-item"><span>GPU:</span><span class="highlight">Nvidia A100 Active</span></div>
+            <div class="telemetry-item"><span>KV Cache:</span><span class="highlight">Enabled (JIT)</span></div>
+            <div class="telemetry-item"><span>Rate Limits:</span><span class="highlight">Zero Limits</span></div>
+          </div>
+        </div>
       </div>
-    </main>
-  </div>
+    </div>
+
+    <div class="sidebar-footer">
+      <a href="/docs" target="_blank" class="quick-link">📖 Swagger API Docs</a>
+      <a href="/v1/models" target="_blank" class="quick-link">📋 Models Catalog</a>
+      <a href="/health" target="_blank" class="quick-link">💚 Health & Diagnostics</a>
+      <a href="/gradio" target="_blank" class="quick-link">⚡ Gradio Interface</a>
+    </div>
+  </aside>
+
+  <!-- Main Chat Layout -->
+  <main class="chat-layout">
+    <header class="chat-header">
+      <div class="header-left">
+        <button class="menu-toggle-btn" id="toggleSidebarBtn" title="Toggle Sidebar">☰</button>
+        <div class="header-model-info">
+          <div class="header-model-name">
+            NousResearch/Hermes-3-Llama-3.1-8B
+          </div>
+          <div class="header-status-pill">
+            <div class="status-dot"></div>
+            <span>Connected to Local In-Memory Weights</span>
+          </div>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button class="action-icon-btn" id="clearChatBtn" title="Clear Chat">
+          <span>🗑️</span> Clear
+        </button>
+      </div>
+    </header>
+
+    <!-- Scrollable Messages Container -->
+    <div class="chat-scroll" id="chatScroll">
+      <div class="chat-container" id="chatContainer">
+        <!-- Hero Welcome -->
+        <div class="hero-container" id="heroWelcome">
+          <div class="hero-orb">⚡</div>
+          <h1 class="hero-title">How can I help you build today?</h1>
+          <p class="hero-subtitle">
+            Hermes-3 8B running locally on Nvidia A100 ZeroGPU with native bfloat16 acceleration.
+            Zero external rate limits, instant streaming, and production-grade engineering.
+          </p>
+
+          <div class="prompt-grid">
+            <div class="prompt-card" onclick="useStarterPrompt('Design a distributed real-time notification engine with Redis and WebSockets.')">
+              <div class="prompt-card-icon">🏗️</div>
+              <div class="prompt-card-title">Distributed Systems</div>
+              <div class="prompt-card-desc">Design a distributed notification engine with Redis pub/sub.</div>
+            </div>
+            <div class="prompt-card" onclick="useStarterPrompt('Write an async FastAPI microservice with Pydantic v2 validation and JWT authentication.')">
+              <div class="prompt-card-icon">⚡</div>
+              <div class="prompt-card-title">FastAPI Backend</div>
+              <div class="prompt-card-desc">Write an async FastAPI service with Pydantic v2 schemas.</div>
+            </div>
+            <div class="prompt-card" onclick="useStarterPrompt('Demonstrate the Hermes-3 XML tool calling schema for web browsing and SQL queries.')">
+              <div class="prompt-card-icon">🧠</div>
+              <div class="prompt-card-title">Agentic Tool Calling</div>
+              <div class="prompt-card-desc">Demonstrate tool calling schemas formatted in XML tags.</div>
+            </div>
+            <div class="prompt-card" onclick="useStarterPrompt('Review this Python async code for concurrency race conditions, memory leaks, and performance bottlenecks.')">
+              <div class="prompt-card-icon">🛡️</div>
+              <div class="prompt-card-title">Code Audit & Security</div>
+              <div class="prompt-card-desc">Audit async Python code for race conditions and memory leaks.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Input Dock -->
+    <div class="input-dock">
+      <div class="input-wrapper">
+        <textarea id="chatInput" class="chat-textarea" placeholder="Message Hermes-3 8B... (Shift + Enter for newline)" rows="1"></textarea>
+        <button id="sendBtn" class="send-action-btn" title="Send Message">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="22" y1="2" x2="11" y2="13"></line>
+            <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+          </svg>
+        </button>
+      </div>
+      <div class="input-hint">
+        Hermes-3 8B running in-memory on Hugging Face ZeroGPU • Press Enter to send, Shift + Enter for newline
+      </div>
+    </div>
+  </main>
+
   <script>
-    const messagesContainer = document.getElementById("messagesContainer");
-    const userInput = document.getElementById("userInput");
-    const sendBtn = document.getElementById("sendBtn");
-    const sysPrompt = document.getElementById("sysPrompt");
-    const tempRange = document.getElementById("tempRange");
-    const tempVal = document.getElementById("tempVal");
-    const tokensRange = document.getElementById("tokensRange");
-    const tokensVal = document.getElementById("tokensVal");
-    const clearBtn = document.getElementById("clearBtn");
-
+    // State
     let conversation = [];
+    let isGenerating = false;
+    let abortController = null;
 
-    tempRange.addEventListener("input", (e) => tempVal.innerText = e.target.value);
-    tokensRange.addEventListener("input", (e) => tokensVal.innerText = e.target.value);
+    // Elements
+    const chatContainer = document.getElementById("chatContainer");
+    const chatScroll = document.getElementById("chatScroll");
+    const chatInput = document.getElementById("chatInput");
+    const sendBtn = document.getElementById("sendBtn");
+    const heroWelcome = document.getElementById("heroWelcome");
+    const newChatBtn = document.getElementById("newChatBtn");
+    const clearChatBtn = document.getElementById("clearChatBtn");
+    const toggleSidebarBtn = document.getElementById("toggleSidebarBtn");
+    const sidebar = document.getElementById("sidebar");
+    const tempRange = document.getElementById("tempRange");
+    const tempDisplay = document.getElementById("tempDisplay");
+    const tokensRange = document.getElementById("tokensRange");
+    const tokensDisplay = document.getElementById("tokensDisplay");
+    const systemPromptInput = document.getElementById("systemPromptInput");
 
-    clearBtn.addEventListener("click", () => {
-      conversation = [];
-      messagesContainer.innerHTML = '<div class="message assistant-msg"><strong>Lead Architect:</strong><br>Chat history cleared. How can I assist you next?</div>';
+    // Configure Marked
+    marked.setOptions({
+      highlight: function(code, lang) {
+        if (lang && hljs.getLanguage(lang)) {
+          return hljs.highlight(code, { language: lang }).value;
+        }
+        return hljs.highlightAuto(code).value;
+      },
+      breaks: true
     });
 
-    userInput.addEventListener("keydown", (e) => {
+    // Custom Renderer for Copy Code buttons
+    const renderer = new marked.Renderer();
+    renderer.code = function(code, language) {
+      const validLang = language || 'plaintext';
+      const highlighted = (language && hljs.getLanguage(language))
+        ? hljs.highlight(code, { language }).value
+        : hljs.highlightAuto(code).value;
+      const id = 'code_' + Math.random().toString(36).substr(2, 9);
+      return `
+        <div class="code-block-wrapper">
+          <div class="code-block-header">
+            <span>${validLang.toUpperCase()}</span>
+            <button class="copy-btn" onclick="copyCode('${id}')">📋 Copy</button>
+          </div>
+          <pre><code id="${id}" class="hljs ${validLang}">${highlighted}</code></pre>
+        </div>
+      `;
+    };
+    marked.use({ renderer });
+
+    window.copyCode = function(id) {
+      const el = document.getElementById(id);
+      if (el) {
+        navigator.clipboard.writeText(el.innerText).then(() => {
+          const btn = el.closest('.code-block-wrapper').querySelector('.copy-btn');
+          const original = btn.innerHTML;
+          btn.innerHTML = '✅ Copied!';
+          setTimeout(() => { btn.innerHTML = original; }, 2000);
+        });
+      }
+    };
+
+    // Range Sliders
+    tempRange.addEventListener("input", (e) => tempDisplay.textContent = e.target.value);
+    tokensRange.addEventListener("input", (e) => tokensDisplay.textContent = e.target.value);
+
+    // Sidebar Toggle
+    toggleSidebarBtn.addEventListener("click", () => {
+      sidebar.classList.toggle("closed");
+    });
+
+    // Textarea Auto-Resize
+    chatInput.addEventListener("input", function() {
+      this.style.height = 'auto';
+      this.style.height = Math.min(this.scrollHeight, 160) + 'px';
+    });
+
+    // Keydown Handling
+    chatInput.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
+        if (!isGenerating) {
+          sendMessage();
+        }
+      }
+    });
+
+    sendBtn.addEventListener("click", () => {
+      if (isGenerating) {
+        if (abortController) abortController.abort();
+      } else {
         sendMessage();
       }
     });
 
-    sendBtn.addEventListener("click", sendMessage);
+    newChatBtn.addEventListener("click", resetChat);
+    clearChatBtn.addEventListener("click", resetChat);
+
+    function resetChat() {
+      if (isGenerating && abortController) abortController.abort();
+      conversation = [];
+      chatContainer.innerHTML = "";
+      chatContainer.appendChild(heroWelcome);
+      heroWelcome.style.display = "block";
+      chatInput.value = "";
+      chatInput.style.height = "38px";
+      chatInput.focus();
+    }
+
+    window.useStarterPrompt = function(promptText) {
+      chatInput.value = promptText;
+      sendMessage();
+    };
 
     async function sendMessage() {
-      const text = userInput.value.trim();
-      if (!text) return;
+      const userText = chatInput.value.trim();
+      if (!userText || isGenerating) return;
 
-      userInput.value = "";
-      sendBtn.disabled = true;
+      if (heroWelcome) heroWelcome.style.display = "none";
 
-      const userDiv = document.createElement("div");
-      userDiv.className = "message user-msg";
-      userDiv.textContent = text;
-      messagesContainer.appendChild(userDiv);
+      // Append User Message
+      appendMessage("user", userText);
+      conversation.push({ role: "user", content: userText });
 
-      conversation.push({ role: "user", content: text });
+      chatInput.value = "";
+      chatInput.style.height = "38px";
 
-      const asstDiv = document.createElement("div");
-      asstDiv.className = "message assistant-msg";
-      asstDiv.innerHTML = "<strong>Lead Architect:</strong><br><span class='stream-content'>Thinking...</span>";
-      messagesContainer.appendChild(asstDiv);
-      messagesContainer.scrollTop = messagesContainer.scrollHeight;
+      // Prepare Assistant Placeholder
+      isGenerating = true;
+      setButtonState(true);
+      abortController = new AbortController();
 
-      const streamSpan = asstDiv.querySelector(".stream-content");
       const startTime = performance.now();
+      let firstTokenTime = null;
+      let tokenCount = 0;
+
+      const assistantMsgElements = createAssistantMessageHolder();
+      const contentEl = assistantMsgElements.content;
+      const telemetryEl = assistantMsgElements.telemetry;
+
+      let fullResponse = "";
 
       try {
         const payload = {
           model: "NousResearch/Hermes-3-Llama-3.1-8B",
           messages: [
-            { role: "system", content: sysPrompt.value.trim() },
+            { role: "system", content: systemPromptInput.value.trim() },
             ...conversation
           ],
           temperature: parseFloat(tempRange.value),
@@ -817,23 +1524,27 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
         const response = await fetch("/v1/chat/completions", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
+          body: JSON.stringify(payload),
+          signal: abortController.signal
         });
 
         if (!response.ok) {
-          throw new Error("HTTP error " + response.status);
+          throw new Error(`Server returned HTTP ${response.status}`);
         }
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder("utf-8");
-        let assistantReply = "";
         let buffer = "";
 
-        streamSpan.textContent = "";
+        contentEl.innerHTML = ""; // Clear "thinking..." dots
 
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
+
+          if (!firstTokenTime) {
+            firstTokenTime = performance.now();
+          }
 
           buffer += decoder.decode(value, { stream: true });
           const lines = buffer.split("\\n");
@@ -848,28 +1559,133 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
                 const parsed = JSON.parse(dataStr);
                 const delta = parsed.choices?.[0]?.delta?.content || "";
                 if (delta) {
-                  assistantReply += delta;
-                  streamSpan.textContent = assistantReply;
-                  messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                  fullResponse += delta;
+                  tokenCount++;
+                  renderStreamedContent(contentEl, fullResponse, true);
+                  chatScroll.scrollTop = chatScroll.scrollHeight;
                 }
               } catch (err) {}
             }
           }
         }
 
-        conversation.push({ role: "assistant", content: assistantReply });
+        // Final clean render without cursor
+        renderStreamedContent(contentEl, fullResponse, false);
+        conversation.push({ role: "assistant", content: fullResponse });
 
-        const duration = ((performance.now() - startTime) / 1000).toFixed(2);
-        const meta = document.createElement("div");
-        meta.className = "msg-meta";
-        meta.textContent = `Completed in ${duration}s | ZeroGPU A100`;
-        asstDiv.appendChild(meta);
+        const totalDuration = ((performance.now() - startTime) / 1000).toFixed(2);
+        const tokPerSec = tokenCount > 0 ? (tokenCount / Math.max(totalDuration, 0.1)).toFixed(1) : 0;
+        telemetryEl.textContent = `⚡ ${totalDuration}s • ${tokPerSec} tok/s • ZeroGPU A100`;
 
       } catch (err) {
-        streamSpan.innerHTML = `<span style="color: #f87171;">❌ Generation Error: ${err.message}</span>`;
+        if (err.name === 'AbortError') {
+          renderStreamedContent(contentEl, fullResponse, false);
+          telemetryEl.textContent = `⚠️ Generation stopped by user.`;
+        } else {
+          contentEl.innerHTML = `<span style="color: #ef4444;">❌ Error: ${err.message}</span>`;
+        }
       } finally {
-        sendBtn.disabled = false;
-        userInput.focus();
+        isGenerating = false;
+        setButtonState(false);
+        abortController = null;
+        chatInput.focus();
+      }
+    }
+
+    function renderStreamedContent(el, text, isStreaming) {
+      let rendered = marked.parse(text);
+      if (isStreaming) {
+        rendered += `<span class="streaming-cursor"></span>`;
+      }
+      el.innerHTML = rendered;
+    }
+
+    function appendMessage(role, text) {
+      const row = document.createElement("div");
+      row.className = `message-row ${role}`;
+
+      const avatar = document.createElement("div");
+      avatar.className = `msg-avatar ${role}`;
+      avatar.textContent = role === "user" ? "👤" : "⚡";
+
+      const body = document.createElement("div");
+      body.className = "msg-body";
+
+      const bubble = document.createElement("div");
+      bubble.className = "msg-bubble";
+      bubble.textContent = text;
+
+      body.appendChild(bubble);
+      row.appendChild(body);
+      row.appendChild(avatar);
+
+      chatContainer.appendChild(row);
+      chatScroll.scrollTop = chatScroll.scrollHeight;
+    }
+
+    function createAssistantMessageHolder() {
+      const row = document.createElement("div");
+      row.className = "message-row assistant";
+
+      const avatar = document.createElement("div");
+      avatar.className = "msg-avatar assistant";
+      avatar.textContent = "⚡";
+
+      const body = document.createElement("div");
+      body.className = "msg-body";
+
+      const header = document.createElement("div");
+      header.className = "msg-header";
+      header.innerHTML = `<span>Lead Architect</span><span class="architect-tag">ZeroGPU</span>`;
+
+      const bubble = document.createElement("div");
+      bubble.className = "msg-bubble";
+
+      const content = document.createElement("div");
+      content.innerHTML = `
+        <div class="thinking-box">
+          <div class="typing-dots">
+            <span></span><span></span><span></span>
+          </div>
+          <span>Lead Architect is thinking...</span>
+        </div>
+      `;
+
+      const telemetry = document.createElement("div");
+      telemetry.className = "msg-telemetry";
+
+      bubble.appendChild(content);
+      body.appendChild(header);
+      body.appendChild(bubble);
+      body.appendChild(telemetry);
+
+      row.appendChild(avatar);
+      row.appendChild(body);
+
+      chatContainer.appendChild(row);
+      chatScroll.scrollTop = chatScroll.scrollHeight;
+
+      return { row, content, telemetry };
+    }
+
+    function setButtonState(generating) {
+      if (generating) {
+        sendBtn.classList.add("stop");
+        sendBtn.title = "Stop Generation";
+        sendBtn.innerHTML = `
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+            <rect x="4" y="4" width="16" height="16" rx="2"></rect>
+          </svg>
+        `;
+      } else {
+        sendBtn.classList.remove("stop");
+        sendBtn.title = "Send Message";
+        sendBtn.innerHTML = `
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="22" y1="2" x2="11" y2="13"></line>
+            <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+          </svg>
+        `;
       }
     }
   </script>
@@ -891,6 +1707,7 @@ async def root_view(request: Request):
             "endpoints": {
                 "chat_completions": f"{HF_SPACE_URL}/v1/chat/completions",
                 "health": f"{HF_SPACE_URL}/health",
+                "warmup": f"{HF_SPACE_URL}/v1/warmup",
                 "models": f"{HF_SPACE_URL}/v1/models",
                 "docs": f"{HF_SPACE_URL}/docs",
                 "gradio_ui": f"{HF_SPACE_URL}/gradio"
