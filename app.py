@@ -309,13 +309,8 @@ def stream_local_tokens(prompt_text: str, max_tokens: int, temperature: float, t
 
 @app.on_event("startup")
 async def startup_event():
-    """Trigger model loading on server startup."""
-    logger.info("Initializing server and preparing local model weights...")
-    try:
-        # Load in background or immediately
-        load_local_model()
-    except Exception as e:
-        logger.error(f"Startup model load notice: {e}")
+    """Fast server startup without blocking event loop."""
+    logger.info("Hermes-3 8B Local API Server started and ready for requests.")
 
 @app.get("/health")
 async def health_check():
