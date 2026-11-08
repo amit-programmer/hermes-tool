@@ -11,17 +11,30 @@ from typing import List, Optional, AsyncGenerator
 # --- ZeroGPU Compatibility Layer ---
 # CRITICAL: 'spaces' MUST be imported BEFORE 'torch' for Hugging Face ZeroGPU to intercept CUDA!
 try:
+    import huggingface_hub
+    if not hasattr(huggingface_hub, "HfFolder"):
+        class HfFolder:
+            @staticmethod
+            def get_token():
+                return huggingface_hub.get_token()
+            @staticmethod
+            def save_token(token):
+                return huggingface_hub.login(token=token)
+        huggingface_hub.HfFolder = HfFolder
+
     import spaces
     HAS_SPACES = True
-    print("Hugging Face ZeroGPU environment detected.")
-except ImportError:
+    print("Hugging Face ZeroGPU environment detected.", flush=True)
+except Exception as e:
     HAS_SPACES = False
-    print("Running in standard environment (local / CPU).")
+    print(f"FAILED TO IMPORT SPACES: {type(e).__name__}: {e}", flush=True)
 
     # Mock spaces.GPU decorator for local execution
     class spaces:
         @staticmethod
-        def GPU(duration=120):
+        def GPU(*args, **kwargs):
+            if len(args) == 1 and callable(args[0]):
+                return args[0]
             def decorator(fn):
                 return fn
             return decorator
