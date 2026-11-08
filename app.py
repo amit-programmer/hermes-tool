@@ -167,7 +167,7 @@ def load_local_model():
 app = FastAPI(
     title="Hermes-3 8B Local API Server",
     description="Standalone OpenAI-compatible inference server running Hermes-3 8B locally with zero external API limits.",
-    version="2.3.0"
+    version="2.4.0"
 )
 
 # Enable CORS for external bot & web access
@@ -533,7 +533,7 @@ async def all_exception_handler(request: Request, exc: Exception):
         content={"detail": "Internal Server Error", "error": str(exc), "path": request.url.path}
     )
 
-# --- Fully Responsive GenAI Chatbot Playground (Desktop, Tablet, Mobile) ---
+# --- Fully Responsive GenAI Chatbot with Dark & Light Theme Switcher ---
 HTML_PLAYGROUND = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -548,11 +548,15 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <style>
+    /* Light Theme (Default Existing UI) */
     :root {
       --bg-page: #e8ecf4;
       --bg-app: #f1f4fa;
       --sidebar-bg: #ffffff;
       --card-bg: #ffffff;
+      --card-border: rgba(226, 232, 240, 0.85);
+      --card-shadow: rgba(9, 18, 42, 0.03);
+      --card-shadow-hover: rgba(9, 18, 42, 0.08);
       --primary-navy: #09122a;
       --primary-btn: #fee75c;
       --primary-btn-hover: #fcd734;
@@ -560,7 +564,66 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       --text-heading: #1e293b;
       --text-sub: #64748b;
       --text-muted: #94a3b8;
+      --user-bubble-bg: #09122a;
+      --user-bubble-text: #ffffff;
+      --asst-bubble-bg: #ffffff;
+      --asst-bubble-text: #1e293b;
+      --asst-bubble-border: #e2e8f0;
+      --asst-code-inline: #f1f5f9;
+      --pill-bg: #ffffff;
+      --pill-border: #09122a;
+      --pill-text: #1e293b;
+      --pill-btn-bg: #09122a;
+      --pill-btn-hover: #1e293b;
+      --hero-title-color: #92a4c4;
+      --history-active-bg: #e9eff8;
+      --history-hover-bg: #f1f5f9;
+      --history-icon-bg: #edf2f9;
+      --theme-toggle-bg: #f1f5f9;
+      --theme-toggle-border: #e2e8f0;
+      --theme-toggle-text: #64748b;
+      --window-border: rgba(255, 255, 255, 0.8);
+      --window-shadow: rgba(9, 18, 42, 0.08);
     }
+
+    /* Premium Dark Theme */
+    body.dark-theme {
+      --bg-page: #060911;
+      --bg-app: #0c1220;
+      --sidebar-bg: #101728;
+      --card-bg: #152238;
+      --card-border: #1e2e4a;
+      --card-shadow: rgba(0, 0, 0, 0.25);
+      --card-shadow-hover: rgba(0, 0, 0, 0.45);
+      --primary-navy: #3b82f6;
+      --primary-btn: #fee75c;
+      --primary-btn-hover: #fcd734;
+      --border-soft: #1c2b46;
+      --text-heading: #f1f5f9;
+      --text-sub: #94a3b8;
+      --text-muted: #64748b;
+      --user-bubble-bg: #2563eb;
+      --user-bubble-text: #ffffff;
+      --asst-bubble-bg: #152238;
+      --asst-bubble-text: #f1f5f9;
+      --asst-bubble-border: #1e2e4a;
+      --asst-code-inline: #0d1527;
+      --pill-bg: #152238;
+      --pill-border: #3b82f6;
+      --pill-text: #f8fafc;
+      --pill-btn-bg: #3b82f6;
+      --pill-btn-hover: #2563eb;
+      --hero-title-color: #8da2c7;
+      --history-active-bg: #192742;
+      --history-hover-bg: #16223a;
+      --history-icon-bg: #192742;
+      --theme-toggle-bg: #16223a;
+      --theme-toggle-border: #1c2b46;
+      --theme-toggle-text: #94a3b8;
+      --window-border: #1a2740;
+      --window-shadow: rgba(0, 0, 0, 0.5);
+    }
+
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body {
       height: 100%;
@@ -575,6 +638,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       justify-content: center;
       align-items: center;
       padding: 16px;
+      transition: background 0.25s ease, color 0.25s ease;
     }
 
     /* Outer Application Container Card (Desktop default) */
@@ -584,11 +648,12 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       height: 94vh;
       background: var(--bg-app);
       border-radius: 28px;
-      box-shadow: 0 20px 50px rgba(9, 18, 42, 0.08);
+      box-shadow: 0 20px 50px var(--window-shadow);
       display: flex;
       position: relative;
       overflow: hidden;
-      border: 1px solid rgba(255, 255, 255, 0.8);
+      border: 1px solid var(--window-border);
+      transition: background 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease;
     }
 
     /* Backdrop for Mobile Drawer */
@@ -596,7 +661,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       display: none;
       position: fixed;
       inset: 0;
-      background: rgba(9, 18, 42, 0.45);
+      background: rgba(0, 0, 0, 0.55);
       backdrop-filter: blur(3px);
       z-index: 90;
       opacity: 0;
@@ -617,10 +682,10 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       display: flex;
       flex-direction: column;
       justify-content: space-between;
-      padding: 24px 18px 20px;
+      padding: 22px 18px 20px;
       flex-shrink: 0;
       z-index: 100;
-      transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), background 0.25s ease, border-color 0.25s ease;
     }
     .sidebar-top {
       display: flex;
@@ -638,14 +703,14 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
     .sidebar-drawer-title {
       font-size: 1rem;
       font-weight: 700;
-      color: var(--primary-navy);
+      color: var(--text-heading);
       display: flex;
       align-items: center;
       gap: 8px;
     }
     .drawer-close-btn {
-      background: #f1f5f9;
-      border: none;
+      background: var(--theme-toggle-bg);
+      border: 1px solid var(--border-soft);
       width: 32px;
       height: 32px;
       border-radius: 50%;
@@ -654,9 +719,10 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       justify-content: center;
       cursor: pointer;
       font-size: 1.1rem;
-      color: #64748b;
+      color: var(--text-sub);
     }
 
+    /* Action Buttons Row in Sidebar */
     .btn-row {
       display: flex;
       align-items: center;
@@ -683,9 +749,9 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       background: var(--primary-btn-hover);
       transform: translateY(-1px);
     }
-    .clear-chat-btn {
-      background: #f1f5f9;
-      color: #64748b;
+    .icon-action-btn {
+      background: var(--theme-toggle-bg);
+      color: var(--theme-toggle-text);
       border: 1px solid var(--border-soft);
       width: 42px;
       height: 42px;
@@ -693,15 +759,68 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 1rem;
+      font-size: 1.05rem;
       cursor: pointer;
       transition: all 0.2s;
       flex-shrink: 0;
     }
-    .clear-chat-btn:hover {
+    .icon-action-btn:hover {
+      background: var(--history-hover-bg);
+      color: var(--text-heading);
+      transform: scale(1.05);
+    }
+    .icon-action-btn.danger:hover {
       background: #fee2e2;
       color: #ef4444;
       border-color: #fca5a5;
+    }
+    body.dark-theme .icon-action-btn.danger:hover {
+      background: #7f1d1d;
+      color: #fca5a5;
+      border-color: #991b1b;
+    }
+
+    /* Inner Menu Theme Switcher (Segmented Pill) */
+    .theme-switch-row {
+      margin-top: 2px;
+      display: flex;
+      justify-content: center;
+    }
+    .theme-pill-selector {
+      width: 100%;
+      background: var(--bg-app);
+      border: 1px solid var(--border-soft);
+      border-radius: 9999px;
+      padding: 3px;
+      display: flex;
+      gap: 2px;
+    }
+    .theme-pill-btn {
+      flex: 1;
+      border: none;
+      background: transparent;
+      padding: 7px 12px;
+      border-radius: 9999px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--text-sub);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .theme-pill-btn:hover:not(.active) {
+      color: var(--text-heading);
+    }
+    .theme-pill-btn.active {
+      background: var(--sidebar-bg);
+      color: var(--text-heading);
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    body.dark-theme .theme-pill-btn.active {
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
     }
 
     /* Conversation History */
@@ -709,8 +828,8 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       font-size: 0.92rem;
       font-weight: 700;
       color: var(--text-heading);
-      margin-top: 18px;
-      margin-bottom: 8px;
+      margin-top: 14px;
+      margin-bottom: 6px;
       padding-left: 6px;
     }
     .history-list {
@@ -720,7 +839,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       flex-direction: column;
       gap: 6px;
       margin-top: 4px;
-      max-height: calc(94vh - 220px);
+      max-height: calc(94vh - 270px);
       padding-right: 4px;
     }
     .history-item {
@@ -729,7 +848,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       gap: 10px;
       padding: 10px 12px;
       border-radius: 12px;
-      color: #475569;
+      color: var(--text-sub);
       font-size: 0.84rem;
       font-weight: 500;
       cursor: pointer;
@@ -740,19 +859,22 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       position: relative;
     }
     .history-item:hover {
-      background: #f1f5f9;
-      color: #0f172a;
+      background: var(--history-hover-bg);
+      color: var(--text-heading);
     }
     .history-item.active {
-      background: #e9eff8;
-      color: #09122a;
+      background: var(--history-active-bg);
+      color: var(--primary-navy);
       font-weight: 600;
+    }
+    body.dark-theme .history-item.active {
+      color: #60a5fa;
     }
     .chat-bubble-icon {
       width: 24px;
       height: 24px;
       border-radius: 6px;
-      background: #edf2f9;
+      background: var(--history-icon-bg);
       display: flex;
       align-items: center;
       justify-content: center;
@@ -770,6 +892,11 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       gap: 10px;
       color: #ffffff;
       box-shadow: 0 6px 18px rgba(9, 18, 42, 0.18);
+      transition: background 0.25s ease;
+    }
+    body.dark-theme .profile-card {
+      background: #090e1a;
+      border: 1px solid #1a2740;
     }
     .profile-avatar {
       width: 36px;
@@ -808,6 +935,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       background: var(--bg-app);
       overflow: hidden;
       height: 100%;
+      transition: background 0.25s ease;
     }
 
     /* Mobile Top Header (Visible only on tablets & phones) */
@@ -816,12 +944,13 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       align-items: center;
       justify-content: space-between;
       padding: 12px 18px;
-      background: #ffffff;
+      background: var(--sidebar-bg);
       border-bottom: 1px solid var(--border-soft);
       z-index: 40;
+      transition: background 0.25s ease, border-color 0.25s ease;
     }
     .mobile-nav-toggle {
-      background: #f1f5f9;
+      background: var(--theme-toggle-bg);
       border: 1px solid var(--border-soft);
       width: 38px;
       height: 38px;
@@ -831,7 +960,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       justify-content: center;
       font-size: 1.15rem;
       cursor: pointer;
-      color: #1e293b;
+      color: var(--text-heading);
     }
     .mobile-brand {
       display: flex;
@@ -839,7 +968,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       gap: 8px;
       font-weight: 700;
       font-size: 1rem;
-      color: var(--primary-navy);
+      color: var(--text-heading);
     }
     .mobile-brand .badge {
       font-size: 0.65rem;
@@ -855,7 +984,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       gap: 8px;
     }
     .mobile-action-btn {
-      background: #f1f5f9;
+      background: var(--theme-toggle-bg);
       border: 1px solid var(--border-soft);
       width: 36px;
       height: 36px;
@@ -865,6 +994,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       justify-content: center;
       font-size: 0.95rem;
       cursor: pointer;
+      color: var(--text-heading);
     }
 
     /* Scrollable Container */
@@ -892,10 +1022,11 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
     .hero-title {
       font-size: 2.1rem;
       font-weight: 700;
-      color: #92a4c4;
+      color: var(--hero-title-color);
       margin-bottom: 34px;
       letter-spacing: -0.02em;
       text-align: center;
+      transition: color 0.25s ease;
     }
 
     /* 6 Prompt Cards Grid */
@@ -916,16 +1047,16 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       justify-content: center;
       text-align: center;
       gap: 12px;
-      box-shadow: 0 4px 16px rgba(9, 18, 42, 0.03);
-      border: 1px solid rgba(226, 232, 240, 0.8);
+      box-shadow: 0 4px 16px var(--card-shadow);
+      border: 1px solid var(--card-border);
       cursor: pointer;
       transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
       -webkit-tap-highlight-color: transparent;
     }
     .prompt-card:hover {
       transform: translateY(-4px);
-      box-shadow: 0 10px 24px rgba(9, 18, 42, 0.08);
-      border-color: #cbd5e1;
+      box-shadow: 0 10px 24px var(--card-shadow-hover);
+      border-color: #3b82f6;
     }
     .prompt-card:active {
       transform: scale(0.98);
@@ -936,7 +1067,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
     .prompt-text {
       font-size: 0.88rem;
       font-weight: 600;
-      color: #1e293b;
+      color: var(--text-heading);
     }
 
     /* Messages Stream View */
@@ -966,36 +1097,40 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       font-size: 0.94rem;
       line-height: 1.6;
       word-break: break-word;
+      transition: background 0.2s ease, color 0.2s ease;
     }
     .msg-row.user .bubble {
-      background: var(--primary-navy);
-      color: #ffffff;
+      background: var(--user-bubble-bg);
+      color: var(--user-bubble-text);
       border-bottom-right-radius: 4px;
       max-width: 80%;
       white-space: pre-wrap;
     }
     .msg-row.assistant .bubble {
-      background: #ffffff;
-      color: #1e293b;
-      border: 1px solid var(--border-soft);
+      background: var(--asst-bubble-bg);
+      color: var(--asst-bubble-text);
+      border: 1px solid var(--asst-bubble-border);
       border-bottom-left-radius: 4px;
-      box-shadow: 0 4px 16px rgba(9, 18, 42, 0.04);
+      box-shadow: 0 4px 16px var(--card-shadow);
       max-width: 86%;
     }
 
     /* Markdown inside Assistant Bubble */
     .bubble p { margin-bottom: 12px; }
     .bubble p:last-child { margin-bottom: 0; }
-    .bubble h1, .bubble h2, .bubble h3 { color: #09122a; margin: 14px 0 6px; font-weight: 700; }
+    .bubble h1, .bubble h2, .bubble h3 { color: var(--text-heading); margin: 14px 0 6px; font-weight: 700; }
     .bubble ul, .bubble ol { margin-left: 20px; margin-bottom: 12px; }
     .bubble li { margin-bottom: 4px; }
     .bubble code {
-      background: #f1f5f9;
+      background: var(--asst-code-inline);
       font-family: 'JetBrains Mono', monospace;
       padding: 2px 6px;
       border-radius: 4px;
       font-size: 0.86rem;
       color: #e11d48;
+    }
+    body.dark-theme .bubble code {
+      color: #f43f5e;
     }
 
     /* Code Block inside Assistant Bubble */
@@ -1075,7 +1210,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       display: inline-block;
       width: 7px;
       height: 14px;
-      background: #09122a;
+      background: var(--text-heading);
       margin-left: 2px;
       animation: blink 0.9s infinite;
       vertical-align: middle;
@@ -1087,23 +1222,23 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       padding: 18px 40px 24px;
       display: flex;
       justify-content: center;
-      background: linear-gradient(180deg, transparent 0%, rgba(241, 244, 250, 0.95) 40%);
+      background: linear-gradient(180deg, transparent 0%, var(--bg-app) 45%);
     }
     .pill-input-box {
       width: 100%;
       max-width: 920px;
-      background: #ffffff;
-      border: 2.5px solid var(--primary-navy);
+      background: var(--pill-bg);
+      border: 2.5px solid var(--pill-border);
       border-radius: 9999px;
       padding: 6px 8px 6px 24px;
       display: flex;
       align-items: center;
       gap: 12px;
-      box-shadow: 0 8px 24px rgba(9, 18, 42, 0.08);
+      box-shadow: 0 8px 24px var(--card-shadow);
       transition: all 0.2s;
     }
     .pill-input-box:focus-within {
-      box-shadow: 0 10px 30px rgba(9, 18, 42, 0.14);
+      box-shadow: 0 10px 30px var(--card-shadow-hover);
       transform: translateY(-1px);
     }
     .chat-input {
@@ -1112,19 +1247,19 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       background: transparent;
       font-size: 0.98rem;
       font-family: inherit;
-      color: var(--text-heading);
+      color: var(--pill-text);
       outline: none;
       padding: 6px 0;
       min-width: 0;
     }
     .chat-input::placeholder {
-      color: #94a3b8;
+      color: var(--text-muted);
     }
     .send-pill-btn {
       width: 44px;
       height: 44px;
       border-radius: 50%;
-      background: var(--primary-navy);
+      background: var(--pill-btn-bg);
       color: #ffffff;
       border: none;
       cursor: pointer;
@@ -1136,11 +1271,11 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       flex-shrink: 0;
     }
     .send-pill-btn:hover:not(:disabled) {
-      background: #1e293b;
+      background: var(--pill-btn-hover);
       transform: scale(1.05);
     }
     .send-pill-btn:disabled {
-      background: #94a3b8;
+      background: var(--text-muted);
       cursor: not-allowed;
     }
     .send-pill-btn.stop {
@@ -1196,7 +1331,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       .app-window {
         width: 100vw;
         height: 100vh;
-        height: 100dvh; /* Dynamic mobile viewport height */
+        height: 100dvh;
         border-radius: 0;
         border: none;
       }
@@ -1208,20 +1343,20 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
         top: 0;
         bottom: 0;
         width: 290px;
-        max-width: 82vw;
+        max-width: 84vw;
         transform: translateX(-100%);
         box-shadow: none;
         z-index: 100;
       }
       .sidebar.open {
         transform: translateX(0);
-        box-shadow: 12px 0 35px rgba(9, 18, 42, 0.25);
+        box-shadow: 12px 0 35px rgba(0, 0, 0, 0.4);
       }
       .sidebar-drawer-header {
         display: flex;
       }
       .history-list {
-        max-height: calc(100vh - 230px);
+        max-height: calc(100vh - 280px);
       }
 
       /* Top Mobile App Header */
@@ -1244,7 +1379,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
         margin-bottom: 18px;
       }
 
-      /* Prompt Cards (Single Column or 2-column on wider mobile) */
+      /* Prompt Cards (Single Column) */
       .prompt-grid {
         grid-template-columns: 1fr;
         gap: 10px;
@@ -1318,7 +1453,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
   <!-- Main Application Window -->
   <div class="app-window">
 
-    <!-- Left Sidebar (Sliding Drawer on Mobile / Fixed on Desktop) -->
+    <!-- Left Sidebar (Inner Menu with Drawer on Mobile / Fixed on Desktop) -->
     <aside class="sidebar" id="sidebar">
       <div class="sidebar-top">
         <!-- Drawer Header for Mobile -->
@@ -1329,13 +1464,29 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
           <button class="drawer-close-btn" id="closeDrawerBtn" title="Close Drawer">✕</button>
         </div>
 
+        <!-- Top Action Buttons Row -->
         <div class="btn-row">
           <button class="new-chat-btn" id="newChatBtn">
             <span>+</span> New Conversation
           </button>
-          <button class="clear-chat-btn" id="clearChatBtn" title="Clear Chat History">
+          <button class="icon-action-btn danger" id="clearChatBtn" title="Clear Chat History">
             🗑️
           </button>
+          <button class="icon-action-btn" id="themeToggleBtn" title="Toggle Dark / Light Theme">
+            🌙
+          </button>
+        </div>
+
+        <!-- Inner Menu Dark / Light Selector (Segmented Pill) -->
+        <div class="theme-switch-row">
+          <div class="theme-pill-selector">
+            <button class="theme-pill-btn active" id="lightThemeOption">
+              <span>☀️</span> Light
+            </button>
+            <button class="theme-pill-btn" id="darkThemeOption">
+              <span>🌙</span> Dark
+            </button>
+          </div>
         </div>
 
         <div class="history-title">Conversation History</div>
@@ -1365,6 +1516,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
           <span class="badge">A100</span>
         </div>
         <div class="mobile-actions">
+          <button class="mobile-action-btn" id="mobileThemeToggleBtn" title="Toggle Theme">🌙</button>
           <button class="mobile-action-btn" id="mobileNewChatBtn" title="New Chat">➕</button>
         </div>
       </header>
@@ -1451,6 +1603,57 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
     const mobileNewChatBtn = document.getElementById("mobileNewChatBtn");
     const clearChatBtn = document.getElementById("clearChatBtn");
     const historyList = document.getElementById("historyList");
+
+    // Theme Elements
+    const themeToggleBtn = document.getElementById("themeToggleBtn");
+    const mobileThemeToggleBtn = document.getElementById("mobileThemeToggleBtn");
+    const lightThemeOption = document.getElementById("lightThemeOption");
+    const darkThemeOption = document.getElementById("darkThemeOption");
+
+    // --- Theme Switcher Logic ---
+    function applyTheme(theme) {
+      const isDark = theme === "dark";
+      if (isDark) {
+        document.body.classList.add("dark-theme");
+        if (themeToggleBtn) {
+          themeToggleBtn.innerHTML = "☀️";
+          themeToggleBtn.title = "Switch to Light Mode";
+        }
+        if (mobileThemeToggleBtn) {
+          mobileThemeToggleBtn.innerHTML = "☀️";
+          mobileThemeToggleBtn.title = "Switch to Light Mode";
+        }
+        if (darkThemeOption) darkThemeOption.classList.add("active");
+        if (lightThemeOption) lightThemeOption.classList.remove("active");
+      } else {
+        document.body.classList.remove("dark-theme");
+        if (themeToggleBtn) {
+          themeToggleBtn.innerHTML = "🌙";
+          themeToggleBtn.title = "Switch to Dark Mode";
+        }
+        if (mobileThemeToggleBtn) {
+          mobileThemeToggleBtn.innerHTML = "🌙";
+          mobileThemeToggleBtn.title = "Switch to Dark Mode";
+        }
+        if (lightThemeOption) lightThemeOption.classList.add("active");
+        if (darkThemeOption) darkThemeOption.classList.remove("active");
+      }
+      localStorage.setItem("hermes_theme", theme);
+    }
+
+    function toggleTheme() {
+      const current = localStorage.getItem("hermes_theme") || "light";
+      applyTheme(current === "dark" ? "light" : "dark");
+    }
+
+    if (themeToggleBtn) themeToggleBtn.addEventListener("click", toggleTheme);
+    if (mobileThemeToggleBtn) mobileThemeToggleBtn.addEventListener("click", toggleTheme);
+    if (lightThemeOption) lightThemeOption.addEventListener("click", () => applyTheme("light"));
+    if (darkThemeOption) darkThemeOption.addEventListener("click", () => applyTheme("dark"));
+
+    // Apply saved theme immediately
+    const savedTheme = localStorage.getItem("hermes_theme") || "light";
+    applyTheme(savedTheme);
 
     // Drawer Controls for Mobile/Tablet
     function openSidebar() {
