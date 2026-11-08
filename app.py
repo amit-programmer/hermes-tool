@@ -167,7 +167,7 @@ def load_local_model():
 app = FastAPI(
     title="Hermes-3 8B Local API Server",
     description="Standalone OpenAI-compatible inference server running Hermes-3 8B locally with zero external API limits.",
-    version="2.2.0"
+    version="2.3.0"
 )
 
 # Enable CORS for external bot & web access
@@ -533,12 +533,12 @@ async def all_exception_handler(request: Request, exc: Exception):
         content={"detail": "Internal Server Error", "error": str(exc), "path": request.url.path}
     )
 
-# --- Clean GenAI Style Chatbot Playground (Matching Reference Screenshot) ---
+# --- Fully Responsive GenAI Chatbot Playground (Desktop, Tablet, Mobile) ---
 HTML_PLAYGROUND = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>GenAI | Hermes-3 8B Architecture</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -562,6 +562,11 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       --text-muted: #94a3b8;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      height: 100%;
+      width: 100%;
+      overflow: hidden;
+    }
     body {
       font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
       background: var(--bg-page);
@@ -569,11 +574,10 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       display: flex;
       justify-content: center;
       align-items: center;
-      min-height: 100vh;
       padding: 16px;
     }
 
-    /* Outer Application Container Card */
+    /* Outer Application Container Card (Desktop default) */
     .app-window {
       width: 100%;
       max-width: 1360px;
@@ -582,8 +586,27 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       border-radius: 28px;
       box-shadow: 0 20px 50px rgba(9, 18, 42, 0.08);
       display: flex;
+      position: relative;
       overflow: hidden;
       border: 1px solid rgba(255, 255, 255, 0.8);
+    }
+
+    /* Backdrop for Mobile Drawer */
+    .sidebar-backdrop {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(9, 18, 42, 0.45);
+      backdrop-filter: blur(3px);
+      z-index: 90;
+      opacity: 0;
+      transition: opacity 0.25s ease;
+      pointer-events: none;
+    }
+    .sidebar-backdrop.active {
+      display: block;
+      opacity: 1;
+      pointer-events: auto;
     }
 
     /* Left Sidebar */
@@ -596,12 +619,44 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       justify-content: space-between;
       padding: 24px 18px 20px;
       flex-shrink: 0;
+      z-index: 100;
+      transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     }
     .sidebar-top {
       display: flex;
       flex-direction: column;
       gap: 12px;
+      overflow: hidden;
     }
+    .sidebar-drawer-header {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 6px;
+      padding: 0 4px;
+    }
+    .sidebar-drawer-title {
+      font-size: 1rem;
+      font-weight: 700;
+      color: var(--primary-navy);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .drawer-close-btn {
+      background: #f1f5f9;
+      border: none;
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 1.1rem;
+      color: #64748b;
+    }
+
     .btn-row {
       display: flex;
       align-items: center;
@@ -641,6 +696,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       font-size: 1rem;
       cursor: pointer;
       transition: all 0.2s;
+      flex-shrink: 0;
     }
     .clear-chat-btn:hover {
       background: #fee2e2;
@@ -742,7 +798,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       font-weight: 500;
     }
 
-    /* Main Chat Section */
+    /* Main Chat Workspace */
     .main-chat {
       flex: 1;
       display: flex;
@@ -751,6 +807,64 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       position: relative;
       background: var(--bg-app);
       overflow: hidden;
+      height: 100%;
+    }
+
+    /* Mobile Top Header (Visible only on tablets & phones) */
+    .mobile-header {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 18px;
+      background: #ffffff;
+      border-bottom: 1px solid var(--border-soft);
+      z-index: 40;
+    }
+    .mobile-nav-toggle {
+      background: #f1f5f9;
+      border: 1px solid var(--border-soft);
+      width: 38px;
+      height: 38px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.15rem;
+      cursor: pointer;
+      color: #1e293b;
+    }
+    .mobile-brand {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 700;
+      font-size: 1rem;
+      color: var(--primary-navy);
+    }
+    .mobile-brand .badge {
+      font-size: 0.65rem;
+      background: #fee75c;
+      color: #0f172a;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-weight: 700;
+    }
+    .mobile-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .mobile-action-btn {
+      background: #f1f5f9;
+      border: 1px solid var(--border-soft);
+      width: 36px;
+      height: 36px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.95rem;
+      cursor: pointer;
     }
 
     /* Scrollable Container */
@@ -761,6 +875,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       display: flex;
       flex-direction: column;
       scroll-behavior: smooth;
+      -webkit-overflow-scrolling: touch;
     }
 
     /* Welcome Hero State */
@@ -772,6 +887,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       margin: auto 0;
       padding: 20px 0;
       animation: fadeIn 0.3s ease-out;
+      width: 100%;
     }
     .hero-title {
       font-size: 2.1rem;
@@ -804,11 +920,15 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       border: 1px solid rgba(226, 232, 240, 0.8);
       cursor: pointer;
       transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+      -webkit-tap-highlight-color: transparent;
     }
     .prompt-card:hover {
       transform: translateY(-4px);
       box-shadow: 0 10px 24px rgba(9, 18, 42, 0.08);
       border-color: #cbd5e1;
+    }
+    .prompt-card:active {
+      transform: scale(0.98);
     }
     .prompt-icon {
       font-size: 1.8rem;
@@ -962,11 +1082,12 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
     }
     @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
 
-    /* Bottom Navy Pill Input Bar (Matching Image Exactly) */
+    /* Bottom Navy Pill Input Bar */
     .input-dock {
-      padding: 20px 40px 28px;
+      padding: 18px 40px 24px;
       display: flex;
       justify-content: center;
+      background: linear-gradient(180deg, transparent 0%, rgba(241, 244, 250, 0.95) 40%);
     }
     .pill-input-box {
       width: 100%;
@@ -994,6 +1115,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       color: var(--text-heading);
       outline: none;
       padding: 6px 0;
+      min-width: 0;
     }
     .chat-input::placeholder {
       color: #94a3b8;
@@ -1028,27 +1150,185 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       background: #dc2626;
     }
 
-    @media (max-width: 992px) {
-      .app-window { border-radius: 0; height: 100vh; }
-      .prompt-grid { grid-template-columns: repeat(2, 1fr); }
-      body { padding: 0; }
+    /* ========================================================= */
+    /* RESPONSIVE BREAKPOINTS (Desktop, Tablet, Mobile)          */
+    /* ========================================================= */
+
+    /* 1. TABLET VIEW (768px to 1024px) */
+    @media (max-width: 1024px) {
+      body {
+        padding: 0;
+      }
+      .app-window {
+        width: 100vw;
+        height: 100vh;
+        border-radius: 0;
+        border: none;
+      }
+      .sidebar {
+        width: 250px;
+        padding: 20px 14px 16px;
+      }
+      .chat-scroll {
+        padding: 24px 28px 10px;
+      }
+      .prompt-grid {
+        grid-template-columns: repeat(2, 1fr);
+        gap: 14px;
+      }
+      .prompt-card {
+        padding: 22px 16px;
+      }
+      .hero-title {
+        font-size: 1.8rem;
+        margin-bottom: 24px;
+      }
+      .input-dock {
+        padding: 14px 28px 20px;
+      }
     }
+
+    /* 2. MOBILE VIEW (under 768px) */
     @media (max-width: 768px) {
-      .sidebar { display: none; }
-      .prompt-grid { grid-template-columns: 1fr; }
-      .chat-scroll { padding: 18px 16px; }
-      .input-dock { padding: 12px 16px 18px; }
+      body {
+        padding: 0;
+      }
+      .app-window {
+        width: 100vw;
+        height: 100vh;
+        height: 100dvh; /* Dynamic mobile viewport height */
+        border-radius: 0;
+        border: none;
+      }
+
+      /* Sliding Mobile Drawer */
+      .sidebar {
+        position: fixed;
+        left: 0;
+        top: 0;
+        bottom: 0;
+        width: 290px;
+        max-width: 82vw;
+        transform: translateX(-100%);
+        box-shadow: none;
+        z-index: 100;
+      }
+      .sidebar.open {
+        transform: translateX(0);
+        box-shadow: 12px 0 35px rgba(9, 18, 42, 0.25);
+      }
+      .sidebar-drawer-header {
+        display: flex;
+      }
+      .history-list {
+        max-height: calc(100vh - 230px);
+      }
+
+      /* Top Mobile App Header */
+      .mobile-header {
+        display: flex;
+      }
+
+      /* Main Area */
+      .main-chat {
+        height: 100%;
+      }
+      .chat-scroll {
+        padding: 16px 14px 10px;
+      }
+      .hero-view {
+        padding: 10px 0;
+      }
+      .hero-title {
+        font-size: 1.45rem;
+        margin-bottom: 18px;
+      }
+
+      /* Prompt Cards (Single Column or 2-column on wider mobile) */
+      .prompt-grid {
+        grid-template-columns: 1fr;
+        gap: 10px;
+      }
+      .prompt-card {
+        padding: 16px 16px;
+        flex-direction: row;
+        justify-content: flex-start;
+        text-align: left;
+        gap: 14px;
+        border-radius: 14px;
+      }
+      .prompt-icon {
+        font-size: 1.4rem;
+      }
+      .prompt-text {
+        font-size: 0.85rem;
+      }
+
+      /* Message Bubbles on Mobile */
+      .msg-row.user .bubble {
+        max-width: 90%;
+        padding: 12px 14px;
+        font-size: 0.9rem;
+      }
+      .msg-row.assistant .bubble {
+        max-width: 95%;
+        padding: 14px 14px;
+        font-size: 0.9rem;
+      }
+
+      /* Bottom Input Dock on Mobile */
+      .input-dock {
+        padding: 10px 14px;
+        padding-bottom: max(14px, env(safe-area-inset-bottom));
+      }
+      .pill-input-box {
+        padding: 4px 6px 4px 16px;
+        border-width: 2px;
+      }
+      .chat-input {
+        font-size: 0.92rem;
+        padding: 4px 0;
+      }
+      .send-pill-btn {
+        width: 38px;
+        height: 38px;
+        font-size: 1rem;
+      }
+    }
+
+    /* Small Mobile Phones (under 480px) */
+    @media (max-width: 480px) {
+      .hero-title {
+        font-size: 1.35rem;
+      }
+      .sidebar {
+        width: 270px;
+      }
+      .prompt-card {
+        padding: 14px 14px;
+      }
     }
   </style>
 </head>
 <body>
 
-  <!-- Main Window -->
+  <!-- Backdrop for Mobile Sidebar Drawer -->
+  <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
+
+  <!-- Main Application Window -->
   <div class="app-window">
 
-    <!-- Left Sidebar -->
-    <aside class="sidebar">
+    <!-- Left Sidebar (Sliding Drawer on Mobile / Fixed on Desktop) -->
+    <aside class="sidebar" id="sidebar">
       <div class="sidebar-top">
+        <!-- Drawer Header for Mobile -->
+        <div class="sidebar-drawer-header">
+          <div class="sidebar-drawer-title">
+            <span>⚡ GenAI</span>
+          </div>
+          <button class="drawer-close-btn" id="closeDrawerBtn" title="Close Drawer">✕</button>
+        </div>
+
         <div class="btn-row">
           <button class="new-chat-btn" id="newChatBtn">
             <span>+</span> New Conversation
@@ -1060,7 +1340,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
 
         <div class="history-title">Conversation History</div>
         <div class="history-list" id="historyList">
-          <!-- Dynamically populated or default history items -->
+          <!-- Dynamically populated conversations -->
         </div>
       </div>
 
@@ -1076,6 +1356,18 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
 
     <!-- Main Chat Workspace -->
     <main class="main-chat">
+
+      <!-- Top Header for Mobile & Tablet -->
+      <header class="mobile-header">
+        <button class="mobile-nav-toggle" id="openDrawerBtn" title="Open History">☰</button>
+        <div class="mobile-brand">
+          <span>GenAI Hermes-3</span>
+          <span class="badge">A100</span>
+        </div>
+        <div class="mobile-actions">
+          <button class="mobile-action-btn" id="mobileNewChatBtn" title="New Chat">➕</button>
+        </div>
+      </header>
 
       <!-- Scrollable Chat Stream -->
       <div class="chat-scroll" id="chatScroll">
@@ -1146,14 +1438,32 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
     let currentSessionId = null;
 
     // Elements
+    const sidebar = document.getElementById("sidebar");
+    const sidebarBackdrop = document.getElementById("sidebarBackdrop");
+    const openDrawerBtn = document.getElementById("openDrawerBtn");
+    const closeDrawerBtn = document.getElementById("closeDrawerBtn");
     const chatScroll = document.getElementById("chatScroll");
     const heroView = document.getElementById("heroView");
     const messagesStream = document.getElementById("messagesStream");
     const chatInput = document.getElementById("chatInput");
     const sendBtn = document.getElementById("sendBtn");
     const newChatBtn = document.getElementById("newChatBtn");
+    const mobileNewChatBtn = document.getElementById("mobileNewChatBtn");
     const clearChatBtn = document.getElementById("clearChatBtn");
     const historyList = document.getElementById("historyList");
+
+    // Drawer Controls for Mobile/Tablet
+    function openSidebar() {
+      sidebar.classList.add("open");
+      sidebarBackdrop.classList.add("active");
+    }
+    function closeSidebar() {
+      sidebar.classList.remove("open");
+      sidebarBackdrop.classList.remove("active");
+    }
+    if (openDrawerBtn) openDrawerBtn.addEventListener("click", openSidebar);
+    if (closeDrawerBtn) closeDrawerBtn.addEventListener("click", closeSidebar);
+    if (sidebarBackdrop) sidebarBackdrop.addEventListener("click", closeSidebar);
 
     // Configure Marked
     marked.setOptions({
@@ -1215,7 +1525,6 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       historyList.innerHTML = "";
 
       if (sessions.length === 0) {
-        // Default placeholder items matching screenshot style
         const demoTitles = [
           "Stress & Anxiety Everytime",
           "Not Having Enough Money",
@@ -1228,7 +1537,10 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
           const item = document.createElement("div");
           item.className = "history-item";
           item.innerHTML = `<span class="chat-bubble-icon">💬</span><span>${title}</span>`;
-          item.onclick = () => { triggerPrompt("Tell me more about " + title); };
+          item.onclick = () => {
+            closeSidebar();
+            triggerPrompt("Tell me more about " + title);
+          };
           historyList.appendChild(item);
         });
         return;
@@ -1238,13 +1550,17 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
         const item = document.createElement("div");
         item.className = "history-item" + (sess.id === currentSessionId ? " active" : "");
         item.innerHTML = `<span class="chat-bubble-icon">💬</span><span>${sess.title}</span>`;
-        item.onclick = () => loadSession(sess.id);
+        item.onclick = () => {
+          closeSidebar();
+          loadSession(sess.id);
+        };
         historyList.appendChild(item);
       });
     }
 
     function startNewSession() {
       if (isGenerating && abortController) abortController.abort();
+      closeSidebar();
       currentSessionId = "sess_" + Date.now();
       conversation = [];
       messagesStream.innerHTML = "";
@@ -1258,6 +1574,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
     function clearAllHistory() {
       if (confirm("Are you sure you want to clear conversation history?")) {
         if (isGenerating && abortController) abortController.abort();
+        closeSidebar();
         localStorage.removeItem("hermes_chat_sessions");
         startNewSession();
       }
@@ -1285,6 +1602,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
 
     // --- Interaction ---
     newChatBtn.addEventListener("click", startNewSession);
+    if (mobileNewChatBtn) mobileNewChatBtn.addEventListener("click", startNewSession);
     clearChatBtn.addEventListener("click", clearAllHistory);
 
     chatInput.addEventListener("keydown", (e) => {
@@ -1413,7 +1731,6 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
         renderStreamedContent(contentEl, fullResponse, false);
         conversation.push({ role: "assistant", content: fullResponse });
 
-        // Update session in storage
         sess.messages = conversation;
         saveSessions(sessions);
 
