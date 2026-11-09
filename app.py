@@ -45,11 +45,46 @@ from transformers import (
     AutoModelForCausalLM,
     TextIteratorStreamer
 )
-from fastapi import FastAPI, HTTPException, Request
+import io
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+
+# Safe Document & Media Extraction Parsers (No Vector DB Required)
+try:
+    import pypdf
+except ImportError:
+    pypdf = None
+
+try:
+    import docx
+except ImportError:
+    docx = None
+
+try:
+    import openpyxl
+    import pandas as pd
+except ImportError:
+    openpyxl = None
+    pd = None
+
+try:
+    from pptx import Presentation
+except ImportError:
+    Presentation = None
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
+
 
 # Load environment variables from .env
 load_dotenv()
@@ -522,6 +557,310 @@ async def chat_completions(req: ChatCompletionRequest):
             "execution_time_seconds": round(duration, 3),
             "backend": "Local Weights In-Memory Execution"
         }
+    }
+
+# --- File Extraction & Multipart Chat Endpoints (Zero Vector DB) ---
+def extract_content_from_file(filename: str, file_bytes: bytes) -> dict:
+    """
+    Extracts text, data tables, or OCR content from uploaded files without Vector DB.
+    Directly extracts and formats PDF, Word, Excel, PPTX, CSV, TXT, Code, and Images.
+    """
+    ext = os.path.splitext(filename)[1].lower()
+    size_kb = round(len(file_bytes) / 1024, 2)
+    result = {
+        "filename": filename,
+        "extension": ext,
+        "size_kb": size_kb,
+        "success": True,
+        "extracted_text": "",
+        "summary": "",
+        "error": None
+    }
+
+    try:
+        # 1. Plain text & Code files
+        text_extensions = {
+            ".txt", ".md", ".py", ".js", ".jsx", ".ts", ".tsx", ".html",
+            ".css", ".json", ".yaml", ".yml", ".xml", ".sql", ".sh",
+            ".bat", ".env", ".c", ".cpp", ".h", ".java", ".go", ".rs",
+            ".php", ".rb", ".ini", ".conf", ".log"
+        }
+        if ext in text_extensions:
+            try:
+                text = file_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                text = file_bytes.decode("latin-1", errors="replace")
+            result["extracted_text"] = text
+            result["summary"] = f"Text/code file ({len(text)} characters, {len(text.splitlines())} lines)"
+            return result
+
+        # 2. PDF Files (.pdf)
+        if ext == ".pdf":
+            if pypdf is not None:
+                try:
+                    reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+                    num_pages = len(reader.pages)
+                    pages_content = []
+                    for p_idx, page in enumerate(reader.pages):
+                        p_text = page.extract_text() or ""
+                        if p_text.strip():
+                            pages_content.append(f"--- [Page {p_idx + 1}/{num_pages}] ---\n{p_text.strip()}")
+                    combined_text = "\n\n".join(pages_content)
+                    result["extracted_text"] = combined_text
+                    result["summary"] = f"PDF document with {num_pages} page(s) ({len(combined_text.split())} words)"
+                    return result
+                except Exception as pe:
+                    result["extracted_text"] = f"[Error reading PDF {filename}: {str(pe)}]"
+                    result["error"] = str(pe)
+                    return result
+            else:
+                result["extracted_text"] = f"[PDF file: {filename} uploaded, but 'pypdf' library is not available in environment]"
+                result["summary"] = "PDF document (parser pending install)"
+                result["error"] = "pypdf library not found"
+                return result
+
+        # 3. Word Documents (.docx, .doc)
+        if ext in (".docx", ".doc"):
+            if docx is not None:
+                try:
+                    doc = docx.Document(io.BytesIO(file_bytes))
+                    doc_parts = []
+                    for p in doc.paragraphs:
+                        if p.text.strip():
+                            doc_parts.append(p.text.strip())
+                    for t_idx, table in enumerate(doc.tables):
+                        table_rows = []
+                        for row in table.rows:
+                            row_cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+                            table_rows.append("| " + " | ".join(row_cells) + " |")
+                        if table_rows:
+                            if len(table_rows) > 1:
+                                col_count = len(table.rows[0].cells)
+                                table_rows.insert(1, "| " + " | ".join(["---"] * col_count) + " |")
+                            doc_parts.append(f"\n[Table {t_idx + 1}]\n" + "\n".join(table_rows))
+                    
+                    combined_text = "\n\n".join(doc_parts)
+                    result["extracted_text"] = combined_text
+                    result["summary"] = f"Word document ({len(doc.paragraphs)} paragraphs, {len(doc.tables)} tables)"
+                    return result
+                except Exception as de:
+                    result["extracted_text"] = f"[Error reading Word document {filename}: {str(de)}]"
+                    result["error"] = str(de)
+                    return result
+            else:
+                result["extracted_text"] = f"[Word file: {filename} uploaded, but 'python-docx' is not available]"
+                result["summary"] = "Word document (parser pending install)"
+                result["error"] = "python-docx library not found"
+                return result
+
+        # 4. Excel & Spreadsheets (.xlsx, .xls, .csv, .tsv)
+        if ext in (".xlsx", ".xls", ".csv", ".tsv"):
+            try:
+                if pd is not None:
+                    if ext == ".csv":
+                        df = pd.read_csv(io.BytesIO(file_bytes))
+                        sheets = {"CSV_Data": df}
+                    elif ext == ".tsv":
+                        df = pd.read_csv(io.BytesIO(file_bytes), sep="\t")
+                        sheets = {"TSV_Data": df}
+                    else:
+                        sheets = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None)
+
+                    sheet_texts = []
+                    for s_name, sheet_df in sheets.items():
+                        total_rows, total_cols = sheet_df.shape
+                        preview_df = sheet_df.head(100)
+                        try:
+                            md_table = preview_df.to_markdown(index=False)
+                        except Exception:
+                            md_table = preview_df.to_string(index=False)
+                        desc = f"### Sheet: {s_name} (Total Rows: {total_rows}, Columns: {total_cols})\n"
+                        desc += f"Columns: {', '.join(str(c) for c in sheet_df.columns)}\n\n"
+                        desc += md_table
+                        if total_rows > 100:
+                            desc += f"\n\n*(Showing preview of first 100 rows out of {total_rows} total rows)*"
+                        sheet_texts.append(desc)
+
+                    combined_text = "\n\n---\n\n".join(sheet_texts)
+                    result["extracted_text"] = combined_text
+                    result["summary"] = f"Spreadsheet with {len(sheets)} sheet(s)"
+                    return result
+                elif ext in (".csv", ".tsv"):
+                    text = file_bytes.decode("utf-8", errors="replace")
+                    result["extracted_text"] = text
+                    result["summary"] = f"CSV/TSV table ({len(text.splitlines())} lines)"
+                    return result
+                else:
+                    result["extracted_text"] = f"[Excel file: {filename} uploaded, but 'pandas/openpyxl' is not available]"
+                    result["summary"] = "Excel spreadsheet"
+                    result["error"] = "pandas/openpyxl library not found"
+                    return result
+            except Exception as xe:
+                result["extracted_text"] = f"[Error reading spreadsheet {filename}: {str(xe)}]"
+                result["error"] = str(xe)
+                return result
+
+        # 5. PowerPoint Presentations (.pptx)
+        if ext == ".pptx":
+            if Presentation is not None:
+                try:
+                    prs = Presentation(io.BytesIO(file_bytes))
+                    slide_texts = []
+                    for s_idx, slide in enumerate(prs.slides):
+                        texts = []
+                        for shape in slide.shapes:
+                            if shape.has_text_frame:
+                                for p in shape.text_frame.paragraphs:
+                                    if p.text.strip():
+                                        texts.append(p.text.strip())
+                        if texts:
+                            slide_texts.append(f"--- [Slide {s_idx + 1}] ---\n" + "\n".join(texts))
+                    combined_text = "\n\n".join(slide_texts)
+                    result["extracted_text"] = combined_text
+                    result["summary"] = f"PowerPoint presentation with {len(prs.slides)} slide(s)"
+                    return result
+                except Exception as ppe:
+                    result["extracted_text"] = f"[Error reading PowerPoint {filename}: {str(ppe)}]"
+                    result["error"] = str(ppe)
+                    return result
+            else:
+                result["extracted_text"] = f"[PowerPoint file: {filename} uploaded, but 'python-pptx' is not available]"
+                result["summary"] = "PowerPoint presentation"
+                result["error"] = "python-pptx library not found"
+                return result
+
+        # 6. Images (.png, .jpg, .jpeg, .webp, .bmp, .gif)
+        if ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"):
+            img_desc = f"[Attached Image File: {filename} (Size: {size_kb} KB)]"
+            if Image is not None:
+                try:
+                    img = Image.open(io.BytesIO(file_bytes))
+                    img_desc += f"\nImage Dimensions: {img.width}x{img.height}px | Format: {img.format} | Color Mode: {img.mode}"
+                    
+                    ocr_text = ""
+                    if pytesseract is not None:
+                        try:
+                            ocr_text = pytesseract.image_to_string(img).strip()
+                        except Exception:
+                            ocr_text = ""
+                    
+                    if ocr_text:
+                        img_desc += f"\n\n[Extracted OCR Text from Image]:\n{ocr_text}"
+                        result["summary"] = f"Image ({img.width}x{img.height}px) with OCR text ({len(ocr_text.split())} words)"
+                    else:
+                        img_desc += "\n\n(No textual content detected via OCR; image metadata extracted.)"
+                        result["summary"] = f"Image ({img.width}x{img.height}px)"
+                    
+                    result["extracted_text"] = img_desc
+                    return result
+                except Exception as ie:
+                    result["extracted_text"] = f"[Image file: {filename} ({size_kb} KB)]"
+                    result["summary"] = f"Image file ({size_kb} KB)"
+                    return result
+            else:
+                result["extracted_text"] = f"[Image file: {filename} ({size_kb} KB)]"
+                result["summary"] = f"Image file ({size_kb} KB)"
+                return result
+
+        # 7. Audio / Video files
+        if ext in (".mp3", ".wav", ".m4a", ".ogg", ".flac", ".mp4", ".mkv", ".webm", ".avi", ".mov"):
+            media_type = "Audio" if ext in (".mp3", ".wav", ".m4a", ".ogg", ".flac") else "Video"
+            desc = (
+                f"[{media_type} File Attached: {filename} (Format: {ext.upper()[1:]}, Size: {size_kb} KB)]\n"
+                f"Direct {media_type.lower()} file metadata parsed without vector database. "
+                f"You may ask questions, transcription guidance, or processing instructions regarding this media."
+            )
+            result["extracted_text"] = desc
+            result["summary"] = f"{media_type} file ({size_kb} KB)"
+            return result
+
+        # 8. Generic binary fallback
+        try:
+            raw_text = file_bytes.decode("utf-8", errors="ignore")
+            if len(raw_text.strip()) > 20:
+                result["extracted_text"] = raw_text
+                result["summary"] = f"Decoded file content ({len(raw_text)} chars)"
+                return result
+        except Exception:
+            pass
+
+        result["extracted_text"] = f"[File Attached: {filename} (Size: {size_kb} KB, Type: {ext})]"
+        result["summary"] = f"Attached file ({size_kb} KB)"
+        return result
+
+    except Exception as e:
+        logger.error(f"Error parsing file {filename}: {e}")
+        result["success"] = False
+        result["error"] = str(e)
+        result["extracted_text"] = f"[Error reading file {filename}: {str(e)}]"
+        result["summary"] = f"File error: {str(e)}"
+        return result
+
+@app.post("/v1/files/extract")
+async def extract_file_endpoint(file: UploadFile = File(...)):
+    """
+    Extracts text, data tables, or OCR content from uploaded files without Vector DB.
+    Supports PDF, Word, Excel, PPTX, CSV, TXT, Code, Images, etc.
+    """
+    try:
+        content_bytes = await file.read()
+        res = extract_content_from_file(file.filename or "unknown_file", content_bytes)
+        return JSONResponse(status_code=200, content=res)
+    except Exception as e:
+        logger.error(f"Error in /v1/files/extract: {e}")
+        return JSONResponse(status_code=500, content={"success": False, "error": str(e), "extracted_text": ""})
+
+@app.post("/v1/chat/upload-and-complete")
+async def chat_upload_and_complete(
+    file: UploadFile = File(...),
+    prompt: Optional[str] = Form(None),
+    max_tokens: Optional[int] = Form(1024),
+    temperature: Optional[float] = Form(0.7)
+):
+    """
+    Convenience multipart endpoint to upload a file + question together in one request.
+    Extracts file content, constructs the prompt, and returns the completion.
+    """
+    if model is None:
+        try:
+            load_local_model()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Model is not loaded: {str(e)}")
+
+    content_bytes = await file.read()
+    extracted = extract_content_from_file(file.filename or "file", content_bytes)
+    
+    file_context = extracted.get("extracted_text", "")
+    user_prompt = (prompt or "Please analyze and summarize this attached file.").strip()
+    
+    combined_user_content = (
+        f"[ATTACHED FILE: {extracted['filename']} ({extracted['summary']})]\n"
+        f"--- BEGIN FILE CONTENT ---\n{file_context}\n--- END FILE CONTENT ---\n\n"
+        f"User Query:\n{user_prompt}"
+    )
+    
+    messages = [
+        Message(role="system", content=DEFAULT_SYSTEM_PROMPT),
+        Message(role="user", content=combined_user_content)
+    ]
+    prompt_text = construct_chatml_prompt(messages)
+    
+    generated = generate_local(
+        prompt_text=prompt_text,
+        max_tokens=max_tokens or 1024,
+        temperature=temperature or 0.7,
+        top_p=0.95
+    )
+    
+    return {
+        "status": "success",
+        "file": {
+            "filename": extracted["filename"],
+            "size_kb": extracted["size_kb"],
+            "summary": extracted["summary"]
+        },
+        "query": user_prompt,
+        "completion": generated
     }
 
 # --- Global Exception Handler (Prevents blank 500 errors) ---
@@ -1219,10 +1558,97 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
 
     /* Bottom Navy Pill Input Bar */
     .input-dock {
-      padding: 18px 40px 24px;
+      padding: 14px 40px 22px;
       display: flex;
-      justify-content: center;
+      flex-direction: column;
+      align-items: center;
       background: linear-gradient(180deg, transparent 0%, var(--bg-app) 45%);
+    }
+    .file-attachment-container {
+      width: 100%;
+      max-width: 920px;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .file-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--card-bg);
+      border: 1.5px solid var(--card-border);
+      border-radius: 9999px;
+      padding: 5px 14px;
+      font-size: 0.82rem;
+      color: var(--text-heading);
+      box-shadow: 0 4px 12px var(--card-shadow);
+      transition: all 0.2s;
+    }
+    .file-chip-icon {
+      font-size: 1.05rem;
+    }
+    .file-chip-name {
+      font-weight: 600;
+      max-width: 260px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .file-chip-size {
+      color: var(--text-muted);
+      font-size: 0.75rem;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .file-chip-remove {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 0.95rem;
+      padding: 0 3px;
+      line-height: 1;
+      transition: color 0.15s;
+    }
+    .file-chip-remove:hover {
+      color: #ef4444;
+    }
+    .attach-pill-btn {
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      background: transparent;
+      color: var(--text-sub);
+      border: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s;
+      flex-shrink: 0;
+    }
+    .attach-pill-btn:hover {
+      color: #3b82f6;
+      background: var(--btn-hover-bg);
+      transform: scale(1.05);
+    }
+    .user-attachment-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(255, 255, 255, 0.2);
+      border: 1px solid rgba(255, 255, 255, 0.35);
+      border-radius: 10px;
+      padding: 3px 10px;
+      font-size: 0.76rem;
+      margin-bottom: 6px;
+      font-weight: 600;
+      width: fit-content;
+    }
+    body.dark-theme .user-attachment-badge {
+      background: rgba(59, 130, 246, 0.2);
+      border-color: rgba(59, 130, 246, 0.45);
     }
     .pill-input-box {
       width: 100%;
@@ -1230,10 +1656,10 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       background: var(--pill-bg);
       border: 2.5px solid var(--pill-border);
       border-radius: 9999px;
-      padding: 6px 8px 6px 24px;
+      padding: 6px 8px 6px 14px;
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
       box-shadow: 0 8px 24px var(--card-shadow);
       transition: all 0.2s;
     }
@@ -1565,8 +1991,28 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
 
       <!-- Bottom Navy Pill Input Dock -->
       <div class="input-dock">
-        <div class="pill-input-box">
-          <input type="text" id="chatInput" class="chat-input" placeholder="Send a message..." autocomplete="off">
+        <!-- File Attachment Preview Bar -->
+        <div class="file-attachment-container" id="fileAttachmentContainer" style="display: none;">
+          <div class="file-chip">
+            <span class="file-chip-icon" id="fileChipIcon">📄</span>
+            <span class="file-chip-name" id="fileChipName">document.pdf</span>
+            <span class="file-chip-size" id="fileChipSize">(0 KB)</span>
+            <button type="button" class="file-chip-remove" id="fileChipRemove" title="Remove attachment">✕</button>
+          </div>
+        </div>
+
+        <div class="pill-input-box" id="pillInputBox">
+          <!-- Hidden File Upload Input -->
+          <input type="file" id="fileInput" style="display: none;" accept=".pdf,.docx,.doc,.xlsx,.xls,.csv,.tsv,.pptx,.txt,.md,.py,.js,.jsx,.ts,.tsx,.html,.css,.json,.xml,.sql,.yaml,.yml,.png,.jpg,.jpeg,.webp,.bmp,.mp3,.wav,.m4a">
+          
+          <!-- Attachment Paperclip Button -->
+          <button type="button" id="attachBtn" class="attach-pill-btn" title="Attach Document, Sheet, Image or File">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
+            </svg>
+          </button>
+
+          <input type="text" id="chatInput" class="chat-input" placeholder="Ask a question, request code, or attach a file..." autocomplete="off">
           <button id="sendBtn" class="send-pill-btn" title="Send Message">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
               <line x1="22" y1="2" x2="11" y2="13"></line>
@@ -1585,6 +2031,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
     let isGenerating = false;
     let abortController = null;
     let currentSessionId = null;
+    let currentAttachedFile = null;
 
     // Elements
     const sidebar = document.getElementById("sidebar");
@@ -1600,6 +2047,16 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
     const mobileNewChatBtn = document.getElementById("mobileNewChatBtn");
     const clearChatBtn = document.getElementById("clearChatBtn");
     const historyList = document.getElementById("historyList");
+
+    // Attachment Elements
+    const attachBtn = document.getElementById("attachBtn");
+    const fileInput = document.getElementById("fileInput");
+    const fileAttachmentContainer = document.getElementById("fileAttachmentContainer");
+    const fileChipIcon = document.getElementById("fileChipIcon");
+    const fileChipName = document.getElementById("fileChipName");
+    const fileChipSize = document.getElementById("fileChipSize");
+    const fileChipRemove = document.getElementById("fileChipRemove");
+    const pillInputBox = document.getElementById("pillInputBox");
 
     // Theme Elements
     const themeToggleBtn = document.getElementById("themeToggleBtn");
@@ -1664,6 +2121,94 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
     if (openDrawerBtn) openDrawerBtn.addEventListener("click", openSidebar);
     if (closeDrawerBtn) closeDrawerBtn.addEventListener("click", closeSidebar);
     if (sidebarBackdrop) sidebarBackdrop.addEventListener("click", closeSidebar);
+
+    // --- File Attachment & Drag-Drop Logic ---
+    function getFileIcon(filename) {
+      const ext = filename.split('.').pop().toLowerCase();
+      if (['pdf'].includes(ext)) return '📄';
+      if (['doc', 'docx'].includes(ext)) return '📝';
+      if (['xls', 'xlsx', 'csv', 'tsv'].includes(ext)) return '📊';
+      if (['ppt', 'pptx'].includes(ext)) return '📽️';
+      if (['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'svg'].includes(ext)) return '🖼️';
+      if (['mp3', 'wav', 'm4a', 'ogg', 'flac'].includes(ext)) return '🎵';
+      if (['mp4', 'mkv', 'webm', 'mov'].includes(ext)) return '🎬';
+      if (['js', 'ts', 'py', 'html', 'css', 'json', 'sql', 'cpp', 'java'].includes(ext)) return '💻';
+      return '📎';
+    }
+
+    function formatFileSize(bytes) {
+      if (!bytes) return '0 B';
+      const k = 1024;
+      const sizes = ['B', 'KB', 'MB', 'GB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+    }
+
+    function handleFileSelection(file) {
+      if (!file) return;
+      const sizeStr = formatFileSize(file.size);
+      const icon = getFileIcon(file.name);
+      currentAttachedFile = {
+        file: file,
+        name: file.name,
+        sizeFormatted: sizeStr,
+        icon: icon
+      };
+      if (fileChipIcon) fileChipIcon.textContent = icon;
+      if (fileChipName) fileChipName.textContent = file.name;
+      if (fileChipSize) fileChipSize.textContent = `(${sizeStr})`;
+      if (fileAttachmentContainer) fileAttachmentContainer.style.display = "flex";
+      chatInput.focus();
+    }
+
+    function removeAttachedFile() {
+      currentAttachedFile = null;
+      if (fileInput) fileInput.value = "";
+      if (fileAttachmentContainer) fileAttachmentContainer.style.display = "none";
+    }
+
+    if (attachBtn) {
+      attachBtn.addEventListener("click", () => {
+        if (fileInput) fileInput.click();
+      });
+    }
+
+    if (fileInput) {
+      fileInput.addEventListener("change", (e) => {
+        if (e.target.files && e.target.files.length > 0) {
+          handleFileSelection(e.target.files[0]);
+        }
+      });
+    }
+
+    if (fileChipRemove) {
+      fileChipRemove.addEventListener("click", (e) => {
+        e.stopPropagation();
+        removeAttachedFile();
+      });
+    }
+
+    // Drag and Drop support
+    ['dragenter', 'dragover'].forEach(eventName => {
+      window.addEventListener(eventName, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (pillInputBox) pillInputBox.style.borderColor = "#3b82f6";
+      }, false);
+    });
+    ['dragleave', 'drop'].forEach(eventName => {
+      window.addEventListener(eventName, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (pillInputBox) pillInputBox.style.borderColor = "";
+      }, false);
+    });
+    window.addEventListener('drop', (e) => {
+      const dt = e.dataTransfer;
+      if (dt && dt.files && dt.files.length > 0) {
+        handleFileSelection(dt.files[0]);
+      }
+    });
 
     // Configure Marked
     marked.setOptions({
@@ -1793,7 +2338,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       messagesStream.innerHTML = "";
 
       conversation.forEach(msg => {
-        appendRenderedBubble(msg.role, msg.content);
+        appendRenderedBubble(msg.role, msg.content, msg.attachment);
       });
 
       renderHistoryUI();
@@ -1801,9 +2346,20 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
     }
 
     // --- Interaction ---
-    newChatBtn.addEventListener("click", startNewSession);
-    if (mobileNewChatBtn) mobileNewChatBtn.addEventListener("click", startNewSession);
-    clearChatBtn.addEventListener("click", clearAllHistory);
+    newChatBtn.addEventListener("click", () => {
+      removeAttachedFile();
+      startNewSession();
+    });
+    if (mobileNewChatBtn) {
+      mobileNewChatBtn.addEventListener("click", () => {
+        removeAttachedFile();
+        startNewSession();
+      });
+    }
+    clearChatBtn.addEventListener("click", () => {
+      removeAttachedFile();
+      clearAllHistory();
+    });
 
     chatInput.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && !e.shiftKey) {
@@ -1825,9 +2381,44 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       sendUserMessage();
     };
 
+    function escapeHtml(str) {
+      return (str || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    }
+
+    function appendRenderedBubble(role, content, attachment) {
+      const row = document.createElement("div");
+      row.className = `msg-row ${role}`;
+
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+
+      if (role === "user") {
+        if (attachment) {
+          const badge = document.createElement("div");
+          badge.className = "user-attachment-badge";
+          badge.innerHTML = `<span>${attachment.icon || "📎"}</span> <span>${escapeHtml(attachment.name)}</span> <span style="opacity: 0.8; font-size: 0.72rem;">${attachment.sizeFormatted ? `(${escapeHtml(attachment.sizeFormatted)})` : ""}</span>`;
+          bubble.appendChild(badge);
+        }
+        if (content) {
+          const txt = document.createElement("div");
+          txt.className = "user-text-content";
+          txt.textContent = content;
+          bubble.appendChild(txt);
+        }
+      } else {
+        bubble.innerHTML = marked.parse(content || "");
+      }
+
+      row.appendChild(bubble);
+      messagesStream.appendChild(row);
+    }
+
     async function sendUserMessage() {
       const text = chatInput.value.trim();
-      if (!text || isGenerating) return;
+      if ((!text && !currentAttachedFile) || isGenerating) return;
 
       if (!currentSessionId) {
         currentSessionId = "sess_" + Date.now();
@@ -1836,22 +2427,35 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       heroView.style.display = "none";
       messagesStream.style.display = "flex";
 
-      // Append user bubble
-      appendRenderedBubble("user", text);
-      conversation.push({ role: "user", content: text });
+      const attachedSnapshot = currentAttachedFile;
+      const userDisplayPrompt = text || (attachedSnapshot ? `Please analyze this file: ${attachedSnapshot.name}` : "");
 
-      // Save/Update title in storage
+      // Append user bubble to UI with attachment badge
+      appendRenderedBubble("user", userDisplayPrompt, attachedSnapshot);
+      conversation.push({
+        role: "user",
+        content: userDisplayPrompt,
+        attachment: attachedSnapshot ? {
+          name: attachedSnapshot.name,
+          sizeFormatted: attachedSnapshot.sizeFormatted,
+          icon: attachedSnapshot.icon
+        } : null
+      });
+
+      // Clear input and attachment preview
+      chatInput.value = "";
+      removeAttachedFile();
+
+      // Save/Update session title in storage
       let sessions = getStoredSessions();
       let sess = sessions.find(s => s.id === currentSessionId);
       if (!sess) {
-        sess = { id: currentSessionId, title: text.slice(0, 26), messages: [] };
+        sess = { id: currentSessionId, title: (attachedSnapshot ? attachedSnapshot.name : userDisplayPrompt).slice(0, 26), messages: [] };
         sessions.unshift(sess);
       }
       sess.messages = conversation;
       saveSessions(sessions);
       renderHistoryUI();
-
-      chatInput.value = "";
 
       // Setup Assistant Holder
       isGenerating = true;
@@ -1869,14 +2473,60 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       let fullResponse = "";
 
       try {
+        let injectedUserContent = userDisplayPrompt;
+
+        // If a file was attached, extract its content via backend first!
+        if (attachedSnapshot && attachedSnapshot.file) {
+          contentEl.innerHTML = `
+            <div class="thinking-dots">
+              <span class="dot-pulse"></span>
+              <span class="dot-pulse"></span>
+              <span class="dot-pulse"></span>
+              <span>Extracting content from ${escapeHtml(attachedSnapshot.name)}...</span>
+            </div>
+          `;
+          try {
+            const formData = new FormData();
+            formData.append("file", attachedSnapshot.file);
+            const extRes = await fetch("/v1/files/extract", {
+              method: "POST",
+              body: formData,
+              signal: abortController.signal
+            });
+            if (extRes.ok) {
+              const fileData = await extRes.json();
+              injectedUserContent = `[ATTACHED FILE: ${fileData.filename} (${fileData.summary})]\n--- BEGIN FILE CONTENT ---\n${fileData.extracted_text}\n--- END FILE CONTENT ---\n\nUser Question:\n${userDisplayPrompt}`;
+            }
+          } catch (extErr) {
+            console.warn("File extraction fallback:", extErr);
+          }
+
+          contentEl.innerHTML = `
+            <div class="thinking-dots">
+              <span class="dot-pulse"></span>
+              <span class="dot-pulse"></span>
+              <span class="dot-pulse"></span>
+              <span>Hermes-3 is analyzing document...</span>
+            </div>
+          `;
+        }
+
+        // Build messages payload for Hermes-3
+        const apiMessages = conversation.map((msg, idx) => {
+          if (idx === conversation.length - 1 && msg.role === "user") {
+            return { role: "user", content: injectedUserContent };
+          }
+          return { role: msg.role, content: msg.content };
+        });
+
         const payload = {
           model: "NousResearch/Hermes-3-Llama-3.1-8B",
           messages: [
-            { role: "system", content: "You are a Lead Co-Founder & Senior Technical Architect. You possess world-class expertise in distributed systems, full-stack software engineering, and pragmatic AI engineering. Write production-ready, clean, scalable, and secure code." },
-            ...conversation
+            { role: "system", content: "You are a Lead Co-Founder & Senior Technical Architect. You possess world-class expertise in distributed systems, full-stack software engineering, pragmatic AI engineering, and comprehensive document analysis. When analyzing attached documents, spreadsheets, code, or images, provide precise, structured, and insightful answers." },
+            ...apiMessages
           ],
           temperature: 0.7,
-          max_tokens: 1024,
+          max_tokens: 1536,
           stream: true
         };
 
@@ -1952,27 +2602,6 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
         chatInput.focus();
       }
     }
-
-    function renderStreamedContent(el, text, isStreaming) {
-      let html = marked.parse(text);
-      if (isStreaming) {
-        html += `<span class="typing-cursor"></span>`;
-      }
-      el.innerHTML = html;
-    }
-
-    function appendRenderedBubble(role, content) {
-      const row = document.createElement("div");
-      row.className = `msg-row ${role}`;
-
-      const bubble = document.createElement("div");
-      bubble.className = "bubble";
-
-      if (role === "user") {
-        bubble.textContent = content;
-      } else {
-        bubble.innerHTML = marked.parse(content);
-      }
 
       row.appendChild(bubble);
       messagesStream.appendChild(row);
