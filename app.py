@@ -2603,8 +2603,12 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       }
     }
 
-      row.appendChild(bubble);
-      messagesStream.appendChild(row);
+    function renderStreamedContent(el, text, isStreaming) {
+      let html = marked.parse(text);
+      if (isStreaming) {
+        html += `<span class="typing-cursor"></span>`;
+      }
+      el.innerHTML = html;
     }
 
     function createAssistantHolder() {
