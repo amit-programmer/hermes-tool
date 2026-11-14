@@ -5,8 +5,9 @@ import json
 import uuid
 import asyncio
 import logging
-from threading import Thread
-from typing import List, Optional, AsyncGenerator
+import re
+from threading import Thread, Lock
+from typing import List, Optional, AsyncGenerator, Union
 
 # --- ZeroGPU Compatibility Layer ---
 # CRITICAL: 'spaces' MUST be imported BEFORE 'torch' for Hugging Face ZeroGPU to intercept CUDA!
@@ -89,6 +90,9 @@ except ImportError:
 # Load environment variables from .env
 load_dotenv()
 
+# Import Short-Term Memory and Document Working Memory Store
+from session_memory import SessionMemoryStore, session_memory_store, PinnedDocument, SessionState
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -135,68 +139,123 @@ tokenizer = None
 model = None
 is_model_loading = False
 model_load_error = None
+_model_load_lock = Lock()
 
-def get_eos_token_ids(tok) -> List[int]:
-    """Retrieves all stop token IDs for Hermes-3 / Llama 3.1."""
+# Hermes-3 Llama 3.1 8B context window (128k native)
+MAX_CONTEXT_BUDGET = 131072
+
+def get_optimal_torch_dtype() -> torch.dtype:
+    """Selects bfloat16 for ZeroGPU / Ampere / Hopper / Ada, float16 for older CUDA, float32 for CPU."""
+    if HAS_SPACES:
+        return torch.bfloat16
+    if torch.cuda.is_available():
+        try:
+            if torch.cuda.is_bf16_supported():
+                return torch.bfloat16
+        except Exception:
+            pass
+        return torch.float16
+    return torch.float32
+
+def get_eos_token_ids(tok, custom_stops: Optional[List[str]] = None) -> List[int]:
+    """Retrieves all stop token IDs for Hermes-3 / Llama 3.1 plus optional custom stop tokens."""
     stop_ids = set()
+    if tok is None:
+        return []
+
     if tok.eos_token_id is not None:
-        if isinstance(tok.eos_token_id, list):
+        if isinstance(tok.eos_token_id, (list, tuple, set)):
             stop_ids.update(tok.eos_token_id)
         else:
             stop_ids.add(tok.eos_token_id)
-    # Crucial Hermes-3 & Llama 3.1 stop tokens
-    for token_str in ["<|im_end|>", "<|eot_id|>", "<|end_of_text|>"]:
+
+    # Core Hermes-3 and Llama 3.1 stop tokens
+    stop_token_strings = ["<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<|im_start|>"]
+    if custom_stops:
+        for cs in custom_stops:
+            if cs and cs not in stop_token_strings:
+                stop_token_strings.append(cs)
+
+    for token_str in stop_token_strings:
         try:
             tid = tok.convert_tokens_to_ids(token_str)
-            if tid is not None and isinstance(tid, int) and tid > 0:
-                stop_ids.add(tid)
+            if tid is not None and isinstance(tid, int) and tid >= 0:
+                if tok.unk_token_id is None or tid != tok.unk_token_id:
+                    stop_ids.add(tid)
         except Exception:
             pass
+        try:
+            enc = tok.encode(token_str, add_special_tokens=False)
+            if len(enc) == 1 and enc[0] >= 0:
+                if tok.unk_token_id is None or enc[0] != tok.unk_token_id:
+                    stop_ids.add(enc[0])
+        except Exception:
+            pass
+
     return list(stop_ids)
 
 def load_local_model():
     """
-    Downloads and loads the model and tokenizer into memory.
-    Uses native bfloat16 on CUDA / ZeroGPU for maximum Tensor Core throughput.
+    Downloads and loads the model and tokenizer into memory with thread-safety.
+    Uses native bfloat16 on CUDA / ZeroGPU with SDPA and KV cache enabled.
     """
     global tokenizer, model, is_model_loading, model_load_error
-    if model is not None:
+    if model is not None and tokenizer is not None:
         return model, tokenizer
 
-    is_model_loading = True
-    try:
-        logger.info(f"1. Downloading / Loading Tokenizer for: {MODEL_ID}...")
-        tokenizer = AutoTokenizer.from_pretrained(
-            MODEL_ID,
-            token=HF_TOKEN,
-            trust_remote_code=True
-        )
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+    with _model_load_lock:
+        if model is not None and tokenizer is not None:
+            return model, tokenizer
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"2. Target device detected: {device.upper()} (ZeroGPU: {HAS_SPACES})")
+        is_model_loading = True
+        try:
+            logger.info(f"1. Downloading / Loading Tokenizer for: {MODEL_ID}...")
+            tokenizer = AutoTokenizer.from_pretrained(
+                MODEL_ID,
+                token=HF_TOKEN,
+                trust_remote_code=True
+            )
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
 
-        dtype = torch.bfloat16 if (torch.cuda.is_available() or HAS_SPACES or torch.cuda.is_bf16_supported()) else torch.float32
-        logger.info(f"   Mounting model with native dtype: {dtype}...")
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_ID,
-            token=HF_TOKEN,
-            torch_dtype=dtype,
-            device_map="auto",
-            low_cpu_mem_usage=True,
-            trust_remote_code=True
-        )
+            dtype = get_optimal_torch_dtype()
+            device_str = "cuda" if torch.cuda.is_available() else "cpu"
+            logger.info(f"2. Target device detected: {device_str.upper()} (ZeroGPU: {HAS_SPACES}, Dtype: {dtype})")
 
-        logger.info(f"3. Model '{MODEL_ID}' successfully loaded into memory! Ready for ultra-low latency inference.")
-        is_model_loading = False
-        return model, tokenizer
+            load_kwargs = {
+                "pretrained_model_name_or_path": MODEL_ID,
+                "token": HF_TOKEN,
+                "torch_dtype": dtype,
+                "device_map": "auto",
+                "low_cpu_mem_usage": True,
+                "trust_remote_code": True,
+            }
 
-    except Exception as e:
-        model_load_error = str(e)
-        is_model_loading = False
-        logger.error(f"Failed to load model into memory: {e}")
-        raise e
+            try:
+                # Transformers >= 4.36 supports native SDPA (Scaled Dot-Product Attention) for Flash Attention & KV cache
+                logger.info("   Mounting model with attn_implementation='sdpa' for optimal KV cache throughput...")
+                model = AutoModelForCausalLM.from_pretrained(
+                    **load_kwargs,
+                    attn_implementation="sdpa"
+                )
+            except Exception as attn_err:
+                logger.info(f"   Note on SDPA mount ({attn_err}); loading with default attention...")
+                model = AutoModelForCausalLM.from_pretrained(**load_kwargs)
+
+            # Ensure KV cache is enabled
+            if hasattr(model, "generation_config") and model.generation_config is not None:
+                model.generation_config.use_cache = True
+
+            logger.info(f"3. Model '{MODEL_ID}' successfully loaded into memory! KV Cache enabled.")
+            is_model_loading = False
+            model_load_error = None
+            return model, tokenizer
+
+        except Exception as e:
+            model_load_error = str(e)
+            is_model_loading = False
+            logger.error(f"Failed to load model into memory: {e}")
+            raise e
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
@@ -223,11 +282,12 @@ class Message(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: Optional[str] = MODEL_ID
     messages: List[Message]
-    max_tokens: Optional[int] = Field(default=2048, ge=1, le=4096)
+    max_tokens: Optional[int] = Field(default=2048, ge=1, le=8192)
     temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0)
     top_p: Optional[float] = Field(default=0.95, ge=0.0, le=1.0)
     stream: Optional[bool] = False
-    stop: Optional[List[str]] = None
+    stop: Optional[Union[str, List[str]]] = None
+    session_id: Optional[str] = None
 
 class ModelPermission(BaseModel):
     id: str = "modelperm-" + uuid.uuid4().hex[:8]
@@ -255,77 +315,154 @@ class ModelCard(BaseModel):
 # --- Helper Functions ---
 def construct_chatml_prompt(messages: List[Message], default_system: str = DEFAULT_SYSTEM_PROMPT) -> str:
     """
-    Constructs Hermes-3 compliant ChatML prompt:
+    Constructs strict Hermes-3 compliant ChatML prompt:
     <|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n
+    Supports system, user, assistant, and tool roles with optional names.
     """
-    has_system = any(m.role.strip().lower() == "system" for m in messages)
+    has_system = any(m.role.strip().lower() == "system" for m in messages if m.role)
     parts = []
 
     if not has_system:
-        parts.append(f"<|im_start|>system\n{default_system}<|im_end|>\n")
+        parts.append(f"<|im_start|>system\n{default_system.strip()}<|im_end|>\n")
 
     for msg in messages:
-        role = msg.role.strip().lower()
+        role = (msg.role or "user").strip().lower()
         content = (msg.content or "").strip()
-        parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+        name_attr = f" name={msg.name.strip()}" if msg.name and msg.name.strip() else ""
+        parts.append(f"<|im_start|>{role}{name_attr}\n{content}<|im_end|>\n")
 
-    parts.append("<|im_start|>assistant\n")
+    # If messages do not conclude with an assistant prefill, prompt the assistant
+    if not messages or (messages[-1].role or "").strip().lower() != "assistant":
+        parts.append("<|im_start|>assistant\n")
+
     return "".join(parts)
 
-def sanitize_assistant_output(raw_text: str) -> str:
+def sanitize_assistant_output(raw_text: str, custom_stops: Optional[List[str]] = None) -> str:
     """
-    Cleans Hermes stop tokens (<|im_end|>) while preserving
+    Cleans Hermes stop tokens (<|im_end|>, <|eot_id|>, <|end_of_text|>) while preserving
     any tool calling tags (<tool_call>, </tool_call>) and agentic structure.
+    Strictly truncates output at the earliest occurrence of any stop token.
     """
-    cleaned = (
-        raw_text.replace("<|im_end|>", "")
-        .replace("<|eot_id|>", "")
-        .replace("<|end_of_text|>", "")
-        .rstrip()
+    stop_markers = ["<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<|im_start|>"]
+    if custom_stops:
+        for cs in custom_stops:
+            if cs and cs not in stop_markers:
+                stop_markers.append(cs)
+
+    earliest_pos = len(raw_text)
+    for marker in stop_markers:
+        pos = raw_text.find(marker)
+        if pos != -1 and pos < earliest_pos:
+            earliest_pos = pos
+
+    return raw_text[:earliest_pos].rstrip()
+
+def enforce_context_budget(prompt_text: str, max_tokens: int, tok) -> str:
+    """
+    Ensures prompt_text fits within the 128k context budget (131,072 tokens).
+    If prompt exceeds budget, gracefully truncates middle content while preserving
+    system prompt directives, document metadata headers, and latest user query.
+    """
+    max_input_tokens = max(1024, MAX_CONTEXT_BUDGET - max_tokens - 256)
+
+    # Fast estimation heuristic (~3.5 chars/token) before tokenizing
+    if len(prompt_text) < max_input_tokens * 3:
+        return prompt_text
+
+    if tok is None:
+        return prompt_text[:max_input_tokens * 4]
+
+    token_ids = tok.encode(prompt_text, add_special_tokens=False)
+    if len(token_ids) <= max_input_tokens:
+        return prompt_text
+
+    logger.warning(
+        f"[ContextBudget] Input prompt ({len(token_ids)} tokens) exceeds max input budget "
+        f"({max_input_tokens} tokens). Applying intelligent middle truncation..."
     )
-    return cleaned
+
+    # Preserve beginning (system prompt, document head) and end (user query)
+    head_tokens = int(max_input_tokens * 0.65)
+    tail_tokens = max_input_tokens - head_tokens - 32
+
+    head_ids = token_ids[:head_tokens]
+    tail_ids = token_ids[-tail_tokens:] if tail_tokens > 0 else []
+
+    head_text = tok.decode(head_ids, skip_special_tokens=False)
+    tail_text = tok.decode(tail_ids, skip_special_tokens=False) if tail_ids else ""
+
+    notice = "\n\n[... Notice: Content truncated to fit within 128k token context budget ...]\n\n"
+    return head_text + notice + tail_text
 
 # --- Core Generation Function ---
-def _generate_core(prompt_text: str, max_tokens: int, temperature: float, top_p: float) -> str:
-    """Generates complete text response directly using the locally loaded model weights."""
+def _generate_core(
+    prompt_text: str,
+    max_tokens: int = 2048,
+    temperature: float = 0.7,
+    top_p: float = 0.95,
+    stop: Optional[List[str]] = None
+) -> str:
+    """Generates complete text response directly using locally loaded model weights with KV cache."""
     if model is None or tokenizer is None:
         load_local_model()
 
     device = model.device
-    inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
-    stop_ids = get_eos_token_ids(tokenizer)
+    prompt_text = enforce_context_budget(prompt_text, max_tokens, tokenizer)
+    max_input_len = max(1024, MAX_CONTEXT_BUDGET - max_tokens - 64)
+    inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=max_input_len).to(device)
+    stop_ids = get_eos_token_ids(tokenizer, custom_stops=stop)
 
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_tokens,
-            temperature=max(temperature, 0.01),
-            top_p=top_p,
-            do_sample=True if temperature > 0.0 else False,
-            use_cache=True,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=stop_ids
-        )
+    gen_kwargs = {
+        **inputs,
+        "max_new_tokens": max_tokens,
+        "use_cache": True,
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": stop_ids,
+    }
+
+    if temperature is not None and temperature > 0.0:
+        gen_kwargs["do_sample"] = True
+        gen_kwargs["temperature"] = float(temperature)
+        gen_kwargs["top_p"] = float(top_p) if top_p is not None else 0.95
+    else:
+        gen_kwargs["do_sample"] = False
+
+    with torch.inference_mode():
+        outputs = model.generate(**gen_kwargs)
 
     generated_tokens = outputs[0][inputs.input_ids.shape[-1]:]
     raw_output = tokenizer.decode(generated_tokens, skip_special_tokens=False)
-    return sanitize_assistant_output(raw_output)
+    return sanitize_assistant_output(raw_output, custom_stops=stop)
 
 # --- Generation with ZeroGPU Decorators ---
 @spaces.GPU(duration=120)
-def generate_local(prompt_text: str, max_tokens: int, temperature: float, top_p: float) -> str:
+def generate_local(
+    prompt_text: str,
+    max_tokens: int = 2048,
+    temperature: float = 0.7,
+    top_p: float = 0.95,
+    stop: Optional[List[str]] = None
+) -> str:
     """Entrypoint for FastAPI inference requests on ZeroGPU."""
-    return _generate_core(prompt_text, max_tokens, temperature, top_p)
+    return _generate_core(prompt_text, max_tokens, temperature, top_p, stop=stop)
 
 @spaces.GPU(duration=120)
-def stream_local_tokens(prompt_text: str, max_tokens: int, temperature: float, top_p: float):
+def stream_local_tokens(
+    prompt_text: str,
+    max_tokens: int = 2048,
+    temperature: float = 0.7,
+    top_p: float = 0.95,
+    stop: Optional[List[str]] = None
+):
     """Streams generated tokens in real-time chunk-by-chunk using TextIteratorStreamer."""
     if model is None or tokenizer is None:
         load_local_model()
 
     device = model.device
-    inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
-    stop_ids = get_eos_token_ids(tokenizer)
+    prompt_text = enforce_context_budget(prompt_text, max_tokens, tokenizer)
+    max_input_len = max(1024, MAX_CONTEXT_BUDGET - max_tokens - 64)
+    inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=max_input_len).to(device)
+    stop_ids = get_eos_token_ids(tokenizer, custom_stops=stop)
 
     streamer = TextIteratorStreamer(
         tokenizer,
@@ -334,29 +471,38 @@ def stream_local_tokens(prompt_text: str, max_tokens: int, temperature: float, t
         timeout=60.0
     )
 
-    generation_kwargs = dict(
+    gen_kwargs = {
         **inputs,
-        streamer=streamer,
-        max_new_tokens=max_tokens,
-        temperature=max(temperature, 0.01),
-        top_p=top_p,
-        do_sample=True if temperature > 0.0 else False,
-        use_cache=True,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=stop_ids
-    )
+        "streamer": streamer,
+        "max_new_tokens": max_tokens,
+        "use_cache": True,
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": stop_ids,
+    }
 
-    thread = Thread(target=model.generate, kwargs=generation_kwargs)
+    if temperature is not None and temperature > 0.0:
+        gen_kwargs["do_sample"] = True
+        gen_kwargs["temperature"] = float(temperature)
+        gen_kwargs["top_p"] = float(top_p) if top_p is not None else 0.95
+    else:
+        gen_kwargs["do_sample"] = False
+
+    thread = Thread(target=model.generate, kwargs=gen_kwargs)
     thread.start()
 
-    stop_tokens = ["<|im_end|>", "<|eot_id|>", "<|end_of_text|>"]
+    stop_markers = ["<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<|im_start|>"]
+    if stop:
+        for s in stop:
+            if s and s not in stop_markers:
+                stop_markers.append(s)
+
     for new_text in streamer:
         has_stop = False
-        for st in stop_tokens:
-            if st in new_text:
-                cleaned = new_text.replace(st, "")
-                if cleaned:
-                    yield cleaned
+        for marker in stop_markers:
+            if marker in new_text:
+                pre_stop = new_text.split(marker)[0]
+                if pre_stop:
+                    yield pre_stop
                 has_stop = True
                 break
         if has_stop:
@@ -369,6 +515,10 @@ def stream_local_tokens(prompt_text: str, max_tokens: int, temperature: float, t
 async def startup_event():
     """Fast server startup with background model preloader and JIT warmup."""
     logger.info("Hermes-3 8B Local API Server initialized.")
+    if os.getenv("SKIP_STARTUP_PRELOAD", "0").lower() in ("1", "true", "yes"):
+        logger.info("SKIP_STARTUP_PRELOAD active; skipping startup background preload.")
+        return
+
     def _preload_and_warm():
         try:
             logger.info("Background preloading model into memory...")
@@ -386,12 +536,15 @@ async def startup_event():
 
 @app.get("/health")
 async def health_check():
-    """Uptime & Model status check."""
+    """Uptime, GPU, KV cache, and Model status check."""
     uptime = time.time() - START_TIME
     device_name = "unknown"
+    vram_mb = 0.0
     if model is not None:
         try:
             device_name = str(model.device)
+            if torch.cuda.is_available():
+                vram_mb = round(torch.cuda.memory_allocated() / (1024 * 1024), 2)
         except Exception:
             pass
 
@@ -401,6 +554,8 @@ async def health_check():
         "model": MODEL_ID,
         "is_model_loaded": model is not None,
         "device": device_name,
+        "vram_allocated_mb": vram_mb,
+        "context_window_tokens": MAX_CONTEXT_BUDGET,
         "cuda_available": torch.cuda.is_available(),
         "has_zerogpu": HAS_SPACES,
         "uptime_seconds": round(uptime, 2),
@@ -421,12 +576,17 @@ async def list_models():
 
 @app.api_route("/v1/warmup", methods=["GET", "POST"])
 async def warmup_endpoint():
-    """Warms up local generation weights."""
+    """Warms up local generation weights and pre-allocates KV cache."""
     if model is None:
+        if is_model_loading:
+            return JSONResponse(
+                status_code=503,
+                content={"status": "loading", "message": "Model is currently loading into memory. Please retry in a few moments."}
+            )
         try:
             load_local_model()
         except Exception as e:
-            return {"status": "error", "detail": str(e)}
+            return JSONResponse(status_code=500, content={"status": "error", "detail": str(e)})
 
     start = time.time()
     try:
@@ -436,10 +596,11 @@ async def warmup_endpoint():
             "status": "warm",
             "latency_ms": round(latency, 2),
             "model": MODEL_ID,
-            "message": "Local model is loaded and fully warm."
+            "device": str(model.device) if model is not None else "unknown",
+            "message": "Local model is loaded, KV cache initialized, and kernels fully warm."
         }
     except Exception as e:
-        return {"status": "error", "detail": str(e)}
+        return JSONResponse(status_code=500, content={"status": "error", "detail": str(e)})
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
@@ -451,12 +612,76 @@ async def chat_completions(req: ChatCompletionRequest):
         raise HTTPException(status_code=400, detail="The 'messages' array must not be empty.")
 
     if model is None:
+        if is_model_loading:
+            raise HTTPException(status_code=503, detail="Model is currently loading into memory. Please retry shortly.")
         try:
             load_local_model()
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Model is not loaded: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Model loading error: {str(e)}")
 
-    prompt_text = construct_chatml_prompt(req.messages)
+    # Parse and normalize custom stop tokens
+    custom_stops = None
+    if req.stop:
+        if isinstance(req.stop, str):
+            custom_stops = [req.stop]
+        elif isinstance(req.stop, list):
+            custom_stops = [s for s in req.stop if isinstance(s, str) and s]
+
+    # Session Short-Term Working Memory handling
+    session = None
+    effective_messages = list(req.messages)
+
+    if req.session_id:
+        session = session_memory_store.get_or_create(req.session_id)
+
+        # If client supplied only single user turn, restore previous turns from session rolling buffer
+        if len(req.messages) == 1 and (req.messages[0].role or "").strip().lower() == "user" and len(session.messages) > 0:
+            reconstructed = [
+                Message(role=sm.role, content=sm.content, name=sm.name)
+                for sm in session.messages
+            ]
+            if not (reconstructed and reconstructed[-1].content == req.messages[0].content):
+                reconstructed.append(req.messages[0])
+            effective_messages = reconstructed
+
+        # Pinned Document Working Memory Injection
+        pinned_context = session.get_pinned_context_block()
+        if pinned_context:
+            already_in_messages = any(
+                pinned_context[:60] in (m.content or "") or
+                "[WORKING MEMORY: PINNED DOCUMENTS" in (m.content or "") or
+                "=== [DOCUMENT:" in (m.content or "")
+                for m in effective_messages
+            )
+            if not already_in_messages:
+                augmented = []
+                system_found = False
+                for m in effective_messages:
+                    if (m.role or "").strip().lower() == "system" and not system_found:
+                        augmented.append(
+                            Message(
+                                role="system",
+                                content=f"{m.content.strip()}\n\n{pinned_context}",
+                                name=m.name
+                            )
+                        )
+                        system_found = True
+                    else:
+                        augmented.append(m)
+                if not system_found:
+                    augmented.insert(
+                        0,
+                        Message(role="system", content=f"{DEFAULT_SYSTEM_PROMPT.strip()}\n\n{pinned_context}")
+                    )
+                effective_messages = augmented
+
+        # Record latest user turn into session rolling buffer
+        for m in reversed(effective_messages):
+            if (m.role or "").strip().lower() == "user" and m.content:
+                session.add_message("user", m.content, name=m.name)
+                break
+
+    prompt_text = construct_chatml_prompt(effective_messages)
     target_model = req.model or MODEL_ID
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created_ts = int(time.time())
@@ -465,12 +690,29 @@ async def chat_completions(req: ChatCompletionRequest):
     if req.stream:
         async def event_generator():
             try:
+                # Initial role chunk conforming to OpenAI streaming standard
+                initial_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_ts,
+                    "model": target_model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": ""},
+                        "finish_reason": None
+                    }]
+                }
+                yield f"data: {json.dumps(initial_chunk)}\n\n"
+
+                accumulated_text = []
                 for token_text in stream_local_tokens(
                     prompt_text=prompt_text,
-                    max_tokens=req.max_tokens,
+                    max_tokens=req.max_tokens or 2048,
                     temperature=req.temperature,
-                    top_p=req.top_p
+                    top_p=req.top_p,
+                    stop=custom_stops
                 ):
+                    accumulated_text.append(token_text)
                     chunk = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
@@ -484,6 +726,10 @@ async def chat_completions(req: ChatCompletionRequest):
                     }
                     yield f"data: {json.dumps(chunk)}\n\n"
                     await asyncio.sleep(0)
+
+                # Persist completed assistant generation in session memory
+                if session and accumulated_text:
+                    session.add_message("assistant", "".join(accumulated_text))
 
                 final_chunk = {
                     "id": completion_id,
@@ -514,26 +760,39 @@ async def chat_completions(req: ChatCompletionRequest):
                 yield f"data: {json.dumps(err_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
 
-        return StreamingResponse(event_generator(), media_type="text/event-stream")
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
 
     # 2. Non-Streaming Generation
     start_infer = time.time()
     try:
         generated_content = generate_local(
             prompt_text=prompt_text,
-            max_tokens=req.max_tokens,
+            max_tokens=req.max_tokens or 2048,
             temperature=req.temperature,
-            top_p=req.top_p
+            top_p=req.top_p,
+            stop=custom_stops
         )
+        if session and generated_content:
+            session.add_message("assistant", generated_content)
     except Exception as e:
         logger.error(f"Local generation error: {e}")
         raise HTTPException(status_code=500, detail=f"Local Generation Error: {str(e)}")
 
     duration = time.time() - start_infer
-    prompt_tokens = max(len(prompt_text.split()), 1)
-    completion_tokens = max(len(generated_content.split()), 1)
 
-    return {
+    # Accurate token usage metrics calculated via tokenizer
+    prompt_tokens = len(tokenizer.encode(prompt_text, add_special_tokens=False)) if tokenizer else max(len(prompt_text.split()), 1)
+    completion_tokens = len(tokenizer.encode(generated_content, add_special_tokens=False)) if tokenizer else max(len(generated_content.split()), 1)
+
+    res_payload = {
         "id": completion_id,
         "object": "chat.completion",
         "created": created_ts,
@@ -558,12 +817,790 @@ async def chat_completions(req: ChatCompletionRequest):
             "backend": "Local Weights In-Memory Execution"
         }
     }
+    if req.session_id:
+        res_payload["session_id"] = req.session_id
+    return res_payload
 
 # --- File Extraction & Multipart Chat Endpoints (Zero Vector DB) ---
+
+MAX_EXTRACT_CHARS = 120_000   # Global context budget cap for extracted text (~25k-30k tokens)
+MAX_PDF_PAGES_SCAN = 100      # Max pages to scan/sample from a PDF
+MAX_PDF_PAGE_CHARS = 3_500    # Max chars per individual PDF page
+MAX_TABLE_ROWS_PREVIEW = 80   # Max rows previewed for tabular datasets (head + tail)
+MAX_TABLE_COLS_PREVIEW = 25   # Max columns to render in markdown table
+MAX_TEXT_LINES = 2_000        # Max lines for source code / plain text files
+MAX_DOCX_PARAS = 1_500        # Max paragraphs in Word document
+MAX_PPTX_SLIDES = 60          # Max slides in PowerPoint presentation
+MAX_EXCEL_SHEETS = 10         # Max sheets to inspect in a workbook
+
+# Safe PIL Decompression Bomb Guard
+if Image is not None:
+    try:
+        Image.MAX_IMAGE_PIXELS = 60_000_000
+    except Exception:
+        pass
+
+CODE_LANG_MAP = {
+    ".py": "python", ".js": "javascript", ".jsx": "javascript", ".ts": "typescript", ".tsx": "typescript",
+    ".html": "html", ".htm": "html", ".css": "css", ".scss": "scss", ".sass": "sass", ".less": "less",
+    ".json": "json", ".jsonl": "json", ".ndjson": "json", ".yaml": "yaml", ".yml": "yaml",
+    ".toml": "toml", ".xml": "xml", ".sql": "sql", ".sh": "bash", ".bash": "bash", ".zsh": "bash",
+    ".bat": "bat", ".cmd": "bat", ".ps1": "powershell", ".env": "ini", ".ini": "ini", ".conf": "ini",
+    ".cfg": "ini", ".c": "c", ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp", ".h": "c", ".hpp": "cpp",
+    ".cs": "csharp", ".java": "java", ".kt": "kotlin", ".kts": "kotlin", ".scala": "scala",
+    ".go": "go", ".rs": "rust", ".rb": "ruby", ".php": "php", ".swift": "swift", ".m": "objectivec",
+    ".mm": "objectivec", ".r": "r", ".dart": "dart", ".lua": "lua", ".pl": "perl",
+    ".vue": "vue", ".svelte": "svelte", ".graphql": "graphql", ".gql": "graphql",
+    ".proto": "protobuf", ".txt": "text", ".text": "text", ".md": "markdown",
+    ".markdown": "markdown", ".rst": "rst", ".log": "text"
+}
+
+def decode_text_bytes(file_bytes: bytes) -> str:
+    """Safely decodes raw bytes across standard character encodings with fallback."""
+    for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+        try:
+            decoded = file_bytes.decode(enc)
+            return decoded.replace("\x00", "")
+        except UnicodeDecodeError:
+            continue
+    return file_bytes.decode("utf-8", errors="replace").replace("\x00", "")
+
+def truncate_text_content(text: str, filename: str, max_lines: int = MAX_TEXT_LINES, max_chars: int = MAX_EXTRACT_CHARS) -> tuple[str, bool]:
+    """
+    Truncates large text or code files smartly (first N lines + last M lines).
+    Returns (processed_text, is_truncated).
+    """
+    lines = text.splitlines()
+    total_lines = len(lines)
+    total_chars = len(text)
+
+    if total_lines <= max_lines and total_chars <= max_chars:
+        return text, False
+
+    head_lines = min(1500, max_lines - 300)
+    tail_lines = min(300, total_lines - head_lines)
+    
+    first_part = "\n".join(lines[:head_lines])
+    last_part = "\n".join(lines[-tail_lines:]) if tail_lines > 0 else ""
+    omitted = total_lines - (head_lines + tail_lines)
+    
+    trunc_msg = f"\n\n// --- [Smart Truncation: Omitted {omitted:,} lines ({total_chars - len(first_part) - len(last_part):,} chars) to preserve context budget. Showing lines 1-{head_lines} and {total_lines - tail_lines + 1}-{total_lines}] ---\n\n"
+    truncated_result = first_part + trunc_msg + last_part
+    return truncated_result, True
+
+def format_dataframe_to_markdown(df, max_rows: int = MAX_TABLE_ROWS_PREVIEW, max_cols: int = MAX_TABLE_COLS_PREVIEW) -> str:
+    """
+    Renders any pandas DataFrame into clean, resilient GitHub-Flavored Markdown.
+    Zero external dependencies: does NOT require `tabulate`.
+    Handles large tables with column truncation, head/tail row sampling, and pipe escaping.
+    """
+    if df is None or df.empty:
+        return "*(Empty table)*"
+
+    total_rows, total_cols = df.shape
+    cols = [str(c) if c is not None else f"Col_{i}" for i, c in enumerate(df.columns)]
+
+    # Determine column slicing
+    is_cols_truncated = False
+    if total_cols > max_cols:
+        is_cols_truncated = True
+        head_cols_count = max_cols - 5
+        head_indices = list(range(head_cols_count))
+        tail_indices = list(range(total_cols - 5, total_cols))
+        selected_col_indices = head_indices + tail_indices
+        display_col_names = [cols[i] for i in head_indices] + [f"... (+{total_cols - max_cols} cols)"] + [cols[i] for i in tail_indices]
+    else:
+        selected_col_indices = list(range(total_cols))
+        display_col_names = cols
+
+    # Determine row slicing
+    is_rows_truncated = False
+    if total_rows > max_rows:
+        is_rows_truncated = True
+        head_n = max(max_rows - 20, 10)
+        tail_n = min(20, max_rows - head_n)
+        head_indices = list(range(head_n))
+        tail_indices = list(range(total_rows - tail_n, total_rows))
+        row_indices = head_indices + [-1] + tail_indices  # -1 represents divider row
+    else:
+        row_indices = list(range(total_rows))
+
+    def clean_cell(val) -> str:
+        if val is None:
+            return ""
+        if pd is not None:
+            try:
+                if pd.isna(val):
+                    return ""
+            except Exception:
+                pass
+        s = str(val).replace("\r\n", " ").replace("\n", " ").replace("\r", " ").replace("|", "\\|")
+        if len(s) > 120:
+            s = s[:117] + "..."
+        return s.strip()
+
+    header_line = "| " + " | ".join(clean_cell(c) for c in display_col_names) + " |"
+    separator_line = "| " + " | ".join(["---"] * len(display_col_names)) + " |"
+    lines = [header_line, separator_line]
+
+    for r_idx in row_indices:
+        if r_idx == -1:
+            lines.append("| " + " | ".join(["..."] * len(display_col_names)) + " |")
+            continue
+        
+        row_series = df.iloc[r_idx]
+        if is_cols_truncated:
+            head_vals = [clean_cell(row_series.iloc[i]) for i in head_indices]
+            tail_vals = [clean_cell(row_series.iloc[i]) for i in tail_indices]
+            row_cells = head_vals + ["..."] + tail_vals
+        else:
+            row_cells = [clean_cell(row_series.iloc[i]) for i in selected_col_indices]
+
+        lines.append("| " + " | ".join(row_cells) + " |")
+
+    notice = []
+    if is_rows_truncated:
+        notice.append(f"Showing {max_rows} of {total_rows:,} total rows (Head + Tail preview)")
+    if is_cols_truncated:
+        notice.append(f"Showing {max_cols} of {total_cols:,} total columns")
+    
+    table_md = "\n".join(lines)
+    if notice:
+        table_md += f"\n\n*({'; '.join(notice)})*"
+
+    return table_md
+
+def summarize_dataframe_schema(df, sheet_name: str) -> str:
+    """
+    Produces high-density schema and statistical metadata for LLM tabular reasoning.
+    Enables Hermes-3 to understand massive datasets (50,000+ rows) without needing
+    every row in prompt context.
+    """
+    total_rows, total_cols = df.shape
+    parts = [
+        f"### Tabular Sheet: `{sheet_name}`",
+        f"- **Total Rows:** {total_rows:,} | **Total Columns:** {total_cols:,}",
+    ]
+
+    col_details = []
+    for i, c in enumerate(df.columns[:35]):
+        col_series = df.iloc[:, i]
+        dtype_str = str(col_series.dtype)
+        null_count = int(col_series.isna().sum()) if pd is not None else 0
+        null_info = f", {null_count} nulls" if null_count > 0 else ", 0 nulls"
+
+        stat_info = ""
+        try:
+            if pd is not None and pd.api.types.is_numeric_dtype(col_series) and not col_series.dropna().empty:
+                s_min = col_series.min()
+                s_max = col_series.max()
+                s_mean = col_series.mean()
+                if isinstance(s_mean, (float, int)):
+                    stat_info = f" [min: {s_min}, mean: {s_mean:.2f}, max: {s_max}]"
+                else:
+                    stat_info = f" [min: {s_min}, max: {s_max}]"
+            elif pd is not None and (pd.api.types.is_object_dtype(col_series) or pd.api.types.is_string_dtype(col_series)):
+                unique_cnt = col_series.nunique(dropna=True)
+                if unique_cnt <= 5 and unique_cnt > 0:
+                    sample_vals = [str(x) for x in col_series.dropna().unique()[:5]]
+                    stat_info = f" [values: {', '.join(sample_vals)}]"
+                else:
+                    stat_info = f" [{unique_cnt:,} unique values]"
+        except Exception:
+            pass
+
+        col_details.append(f"  - `{str(c)}` ({dtype_str}{null_info}){stat_info}")
+
+    if total_cols > 35:
+        col_details.append(f"  - *(+ {total_cols - 35} additional columns omitted from schema list)*")
+
+    if col_details:
+        parts.append("- **Column Schema & Statistics:**\n" + "\n".join(col_details))
+
+    return "\n".join(parts)
+
+def extract_text_code(filename: str, file_bytes: bytes, size_kb: float) -> dict:
+    ext = os.path.splitext(filename)[1].lower()
+    lang = CODE_LANG_MAP.get(ext, "text")
+    raw_text = decode_text_bytes(file_bytes)
+    
+    total_lines = len(raw_text.splitlines())
+    total_chars = len(raw_text)
+    
+    trunc_text, is_truncated = truncate_text_content(raw_text, filename)
+    
+    header = f"### File: `{filename}` ({lang.capitalize()})\n- **Lines:** {total_lines:,} | **Characters:** {total_chars:,} | **Size:** {size_kb:,} KB\n"
+    if is_truncated:
+        header += f"- **Notice:** *Smart Truncation active (large file condensed to fit LLM context).* \n"
+    
+    full_doc = f"{header}\n```{lang}\n{trunc_text}\n```"
+    summary = f"{lang.capitalize()} file ({total_lines:,} lines, {total_chars:,} chars)"
+    if is_truncated:
+        summary += " [condensed]"
+
+    return {
+        "extracted_text": full_doc,
+        "summary": summary,
+        "metadata": {
+            "language": lang,
+            "lines": total_lines,
+            "characters": total_chars,
+            "is_truncated": is_truncated
+        },
+        "error": None
+    }
+
+def extract_pdf(filename: str, file_bytes: bytes, size_kb: float) -> dict:
+    if pypdf is None:
+        return {
+            "extracted_text": f"[PDF file: {filename} uploaded, but 'pypdf' parser is pending install in environment]",
+            "summary": "PDF document (pypdf unavailable)",
+            "metadata": {"pages": 0, "status": "pypdf_missing"},
+            "error": "pypdf library not found"
+        }
+
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+        num_pages = len(reader.pages)
+        if num_pages == 0:
+            return {
+                "extracted_text": f"### PDF Document: `{filename}`\n*(Empty PDF document with 0 pages)*",
+                "summary": "Empty PDF document (0 pages)",
+                "metadata": {"pages": 0, "status": "empty"},
+                "error": None
+            }
+
+        if reader.is_encrypted:
+            try:
+                reader.decrypt("")
+            except Exception:
+                return {
+                    "extracted_text": f"### PDF Document: `{filename}`\n*(This PDF is password-protected/encrypted and cannot be parsed without decryption credentials)*",
+                    "summary": f"Encrypted PDF ({num_pages} pages)",
+                    "metadata": {"pages": num_pages, "encrypted": True},
+                    "error": "PDF is password protected"
+                }
+
+        pdf_meta = {}
+        try:
+            if reader.metadata:
+                for k, v in reader.metadata.items():
+                    clean_k = str(k).lstrip("/").strip()
+                    if clean_k and v:
+                        pdf_meta[clean_k] = str(v).strip()
+        except Exception:
+            pass
+
+        selected_pages = []
+        is_truncated = False
+        if num_pages <= 50:
+            selected_pages = list(range(num_pages))
+        else:
+            is_truncated = True
+            head_pages = list(range(30))
+            tail_pages = list(range(max(num_pages - 15, 30), num_pages))
+            step = max((num_pages - 45) // 9, 1)
+            mid_pages = [p for p in range(30, num_pages - 15, step)[:8] if p not in head_pages and p not in tail_pages]
+            selected_pages = sorted(list(set(head_pages + mid_pages + tail_pages)))
+
+        header_lines = [
+            f"### PDF Document: `{filename}`",
+            f"- **Total Pages:** {num_pages:,} | **File Size:** {size_kb:,} KB",
+        ]
+        if "Title" in pdf_meta:
+            header_lines.append(f"- **Title:** {pdf_meta['Title']}")
+        if "Author" in pdf_meta:
+            header_lines.append(f"- **Author:** {pdf_meta['Author']}")
+        if "Subject" in pdf_meta:
+            header_lines.append(f"- **Subject:** {pdf_meta['Subject']}")
+
+        if is_truncated:
+            header_lines.append(f"- **Notice:** *Smart Truncation active. Showing {len(selected_pages)} key representative pages out of {num_pages:,} total pages (Pages 1-30, sampled middle sections, and concluding pages).*")
+
+        pages_content = []
+        total_extracted_chars = 0
+        char_budget_exceeded = False
+
+        for idx, p_num in enumerate(selected_pages):
+            if total_extracted_chars >= MAX_EXTRACT_CHARS:
+                char_budget_exceeded = True
+                pages_content.append(f"\n*(Context character budget reached. Remaining {len(selected_pages) - idx} sampled pages omitted.)*")
+                break
+
+            try:
+                page = reader.pages[p_num]
+                p_text = (page.extract_text() or "").strip()
+            except Exception as pe:
+                p_text = f"*(Error extracting page {p_num + 1}: {str(pe)})*"
+
+            if p_text:
+                if len(p_text) > MAX_PDF_PAGE_CHARS:
+                    p_text = p_text[:MAX_PDF_PAGE_CHARS] + "\n*(Page text truncated to preserve context budget)*"
+                pages_content.append(f"#### [Page {p_num + 1} of {num_pages}]\n{p_text}")
+                total_extracted_chars += len(p_text)
+
+        is_scanned = (total_extracted_chars < 150 and num_pages > 1)
+        if is_scanned:
+            header_lines.append("- **Scan Advisory:** *⚠️ This document appears to be scanned or contains raster images with minimal selectable text.*")
+
+        full_doc = "\n".join(header_lines) + "\n\n---\n\n" + "\n\n".join(pages_content)
+        summary = f"PDF document with {num_pages} page(s)"
+        if is_truncated or char_budget_exceeded:
+            summary += f" ({len(selected_pages)} sampled pages extracted)"
+        if is_scanned:
+            summary += " [scanned/image-based]"
+
+        return {
+            "extracted_text": full_doc,
+            "summary": summary,
+            "metadata": {
+                "total_pages": num_pages,
+                "extracted_pages": len(selected_pages),
+                "is_truncated": is_truncated or char_budget_exceeded,
+                "is_scanned": is_scanned,
+                **pdf_meta
+            },
+            "error": None
+        }
+    except Exception as e:
+        return {
+            "extracted_text": f"### PDF Document: `{filename}`\n*(Error reading PDF: {str(e)})*",
+            "summary": f"PDF parse error: {str(e)}",
+            "metadata": {"error": str(e)},
+            "error": str(e)
+        }
+
+def extract_word(filename: str, file_bytes: bytes, size_kb: float) -> dict:
+    ext = os.path.splitext(filename)[1].lower()
+    
+    if ext == ".doc" or file_bytes.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        raw_text = decode_text_bytes(file_bytes)
+        words = re.findall(r"[\x20-\x7E\t\n\r]{4,}", raw_text)
+        cleaned = "\n".join(w.strip() for w in words if w.strip())
+        if len(cleaned) > MAX_EXTRACT_CHARS:
+            cleaned = cleaned[:MAX_EXTRACT_CHARS] + "\n\n*(Truncated legacy .doc content)*"
+        
+        md_text = (
+            f"### Word Document (Legacy .doc): `{filename}`\n"
+            f"- **File Size:** {size_kb:,} KB\n"
+            f"> ℹ️ **Notice:** This file uses the legacy binary Word 97-2003 (.doc) format. "
+            f"Extracted plain text stream is provided below. For full tables and styled headings, please convert to .docx.\n\n"
+            f"```text\n{cleaned if cleaned else '*(No readable text stream detected)*'}\n```"
+        )
+        return {
+            "extracted_text": md_text,
+            "summary": f"Legacy Word .doc document ({size_kb} KB)",
+            "metadata": {"format": "legacy_doc", "char_count": len(cleaned)},
+            "error": None
+        }
+
+    if docx is None:
+        return {
+            "extracted_text": f"[Word document: {filename} uploaded, but 'python-docx' is not installed]",
+            "summary": "Word document (python-docx unavailable)",
+            "metadata": {"status": "docx_missing"},
+            "error": "python-docx library not found"
+        }
+
+    try:
+        doc = docx.Document(io.BytesIO(file_bytes))
+        doc_parts = []
+        para_count = len(doc.paragraphs)
+        table_count = len(doc.tables)
+        
+        doc_parts.append(f"### Word Document: `{filename}`")
+        doc_parts.append(f"- **Paragraphs:** {para_count:,} | **Tables:** {table_count:,} | **Size:** {size_kb:,} KB\n---")
+
+        para_rendered = 0
+        is_truncated = False
+        for p in doc.paragraphs:
+            text = p.text.strip()
+            if not text:
+                continue
+            
+            style_name = (p.style.name if p.style else "").lower()
+            if "title" in style_name:
+                doc_parts.append(f"# {text}")
+            elif "heading 1" in style_name:
+                doc_parts.append(f"## {text}")
+            elif "heading 2" in style_name:
+                doc_parts.append(f"### {text}")
+            elif "heading 3" in style_name:
+                doc_parts.append(f"#### {text}")
+            elif "heading" in style_name:
+                doc_parts.append(f"##### {text}")
+            elif "bullet" in style_name:
+                doc_parts.append(f"- {text}")
+            elif "number" in style_name:
+                doc_parts.append(f"1. {text}")
+            else:
+                doc_parts.append(text)
+
+            para_rendered += 1
+            if para_rendered >= MAX_DOCX_PARAS:
+                is_truncated = True
+                doc_parts.append(f"\n*(Smart Truncation: Reached {MAX_DOCX_PARAS:,} paragraphs limit. Remaining paragraphs omitted to protect LLM context.)*")
+                break
+
+        for t_idx, table in enumerate(doc.tables):
+            if len(doc_parts) > 2000 or sum(len(p) for p in doc_parts) >= MAX_EXTRACT_CHARS:
+                doc_parts.append(f"\n*(Omitted remaining {table_count - t_idx} tables due to document size budget)*")
+                break
+
+            table_rows = []
+            row_count = len(table.rows)
+            sample_rows = table.rows if row_count <= 60 else (table.rows[:45] + table.rows[-10:])
+            col_count = len(table.columns) if table.columns else 0
+
+            for r_idx, row in enumerate(sample_rows):
+                cells_text = []
+                for cell in row.cells:
+                    ctext = cell.text.strip().replace("\r\n", " ").replace("\n", " ").replace("|", "\\|")
+                    if len(ctext) > 100:
+                        ctext = ctext[:97] + "..."
+                    cells_text.append(ctext)
+                
+                table_rows.append("| " + " | ".join(cells_text) + " |")
+
+            if table_rows:
+                if len(table_rows) > 1:
+                    actual_cols = len(table.rows[0].cells)
+                    table_rows.insert(1, "| " + " | ".join(["---"] * actual_cols) + " |")
+                
+                t_label = f"\n#### Table {t_idx + 1} ({row_count:,} rows × {col_count} columns)"
+                if row_count > 60:
+                    t_label += f" *(Preview showing first 45 and last 10 rows)*"
+                doc_parts.append(t_label + "\n" + "\n".join(table_rows))
+
+        full_doc = "\n\n".join(doc_parts)
+        summary = f"Word document ({para_count} paragraphs, {table_count} tables)"
+        if is_truncated:
+            summary += " [condensed]"
+
+        return {
+            "extracted_text": full_doc,
+            "summary": summary,
+            "metadata": {
+                "paragraphs": para_count,
+                "tables": table_count,
+                "is_truncated": is_truncated
+            },
+            "error": None
+        }
+    except Exception as e:
+        return {
+            "extracted_text": f"### Word Document: `{filename}`\n*(Error reading Word document: {str(e)})*",
+            "summary": f"Word parse error: {str(e)}",
+            "metadata": {"error": str(e)},
+            "error": str(e)
+        }
+
+def extract_spreadsheet(filename: str, file_bytes: bytes, size_kb: float) -> dict:
+    ext = os.path.splitext(filename)[1].lower()
+    
+    if pd is None:
+        if ext in (".csv", ".tsv"):
+            raw_text = decode_text_bytes(file_bytes)
+            trunc_text, is_trunc = truncate_text_content(raw_text, filename)
+            return {
+                "extracted_text": f"### CSV/TSV Document: `{filename}`\n\n```csv\n{trunc_text}\n```",
+                "summary": f"CSV/TSV table ({len(raw_text.splitlines()):,} lines)",
+                "metadata": {"format": ext, "is_truncated": is_trunc},
+                "error": None
+            }
+        return {
+            "extracted_text": f"[Spreadsheet file: {filename} uploaded, but 'pandas/openpyxl' is not installed]",
+            "summary": "Spreadsheet (parsers unavailable)",
+            "metadata": {"status": "pandas_missing"},
+            "error": "pandas library not found"
+        }
+
+    try:
+        sheets = {}
+        if ext == ".csv":
+            df = None
+            for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+                try:
+                    df = pd.read_csv(io.BytesIO(file_bytes), encoding=enc, on_bad_lines="skip")
+                    break
+                except Exception:
+                    continue
+            if df is None:
+                df = pd.read_csv(io.BytesIO(file_bytes), sep=None, engine="python", on_bad_lines="skip", encoding_errors="replace")
+            sheets = {"CSV_Data": df}
+        elif ext == ".tsv":
+            df = None
+            for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+                try:
+                    df = pd.read_csv(io.BytesIO(file_bytes), sep="\t", encoding=enc, on_bad_lines="skip")
+                    break
+                except Exception:
+                    continue
+            if df is None:
+                df = pd.read_csv(io.BytesIO(file_bytes), sep="\t", on_bad_lines="skip", encoding_errors="replace")
+            sheets = {"TSV_Data": df}
+        else:
+            try:
+                sheets = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None)
+            except Exception:
+                sheets = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, engine="openpyxl")
+
+        sheet_names = list(sheets.keys())
+        total_sheets = len(sheet_names)
+        
+        doc_sections = [
+            f"### Spreadsheet Workbook: `{filename}`",
+            f"- **Total Sheets:** {total_sheets} ({', '.join(sheet_names[:10])}) | **File Size:** {size_kb:,} KB\n---"
+        ]
+
+        total_rows_all_sheets = sum(len(df) for df in sheets.values())
+        is_massive = total_rows_all_sheets > 5000
+
+        active_sheets = sheet_names[:MAX_EXCEL_SHEETS]
+        for s_idx, s_name in enumerate(active_sheets):
+            sheet_df = sheets[s_name]
+            if sheet_df is None or sheet_df.empty:
+                doc_sections.append(f"### Sheet: `{s_name}`\n*(Sheet contains no data)*")
+                continue
+
+            schema_summary = summarize_dataframe_schema(sheet_df, s_name)
+            md_table = format_dataframe_to_markdown(
+                sheet_df,
+                max_rows=MAX_TABLE_ROWS_PREVIEW,
+                max_cols=MAX_TABLE_COLS_PREVIEW
+            )
+
+            section = f"{schema_summary}\n\n#### Data Preview:\n{md_table}"
+            doc_sections.append(section)
+
+        if total_sheets > MAX_EXCEL_SHEETS:
+            doc_sections.append(f"\n*(Notice: Showing first {MAX_EXCEL_SHEETS} of {total_sheets} total sheets. Remaining sheets omitted to respect context limits.)*")
+
+        full_doc = "\n\n---\n\n".join(doc_sections)
+        summary = f"Spreadsheet with {total_sheets} sheet(s), {total_rows_all_sheets:,} total rows"
+        if is_massive:
+            summary += " [smart truncated preview + schema]"
+
+        return {
+            "extracted_text": full_doc,
+            "summary": summary,
+            "metadata": {
+                "sheets": total_sheets,
+                "total_rows": total_rows_all_sheets,
+                "sheet_names": sheet_names,
+                "is_massive": is_massive
+            },
+            "error": None
+        }
+    except Exception as e:
+        return {
+            "extracted_text": f"### Spreadsheet: `{filename}`\n*(Error parsing spreadsheet: {str(e)})*",
+            "summary": f"Spreadsheet parse error: {str(e)}",
+            "metadata": {"error": str(e)},
+            "error": str(e)
+        }
+
+def extract_powerpoint(filename: str, file_bytes: bytes, size_kb: float) -> dict:
+    if Presentation is None:
+        return {
+            "extracted_text": f"[PowerPoint presentation: {filename} uploaded, but 'python-pptx' is not installed]",
+            "summary": "PowerPoint (python-pptx unavailable)",
+            "metadata": {"status": "pptx_missing"},
+            "error": "python-pptx library not found"
+        }
+
+    try:
+        prs = Presentation(io.BytesIO(file_bytes))
+        num_slides = len(prs.slides)
+        if num_slides == 0:
+            return {
+                "extracted_text": f"### Presentation: `{filename}`\n*(Presentation has 0 slides)*",
+                "summary": "Empty PowerPoint presentation",
+                "metadata": {"slides": 0},
+                "error": None
+            }
+
+        is_truncated = False
+        selected_slides = []
+        if num_slides <= MAX_PPTX_SLIDES:
+            selected_slides = list(range(num_slides))
+        else:
+            is_truncated = True
+            head_slides = list(range(25))
+            tail_slides = list(range(max(num_slides - 10, 25), num_slides))
+            step = max((num_slides - 35) // 8, 1)
+            mid_slides = [s for s in range(25, num_slides - 10, step)[:8] if s not in head_slides and s not in tail_slides]
+            selected_slides = sorted(list(set(head_slides + mid_slides + tail_slides)))
+
+        doc_parts = [
+            f"### PowerPoint Presentation: `{filename}`",
+            f"- **Total Slides:** {num_slides:,} | **File Size:** {size_kb:,} KB\n---"
+        ]
+
+        if is_truncated:
+            doc_parts.append(f"> ℹ️ *Smart Truncation active: Showing {len(selected_slides)} key slides out of {num_slides:,} total slides.*")
+
+        for s_idx in selected_slides:
+            slide = prs.slides[s_idx]
+            
+            slide_title = ""
+            try:
+                if slide.shapes.title and slide.shapes.title.text.strip():
+                    slide_title = f": {slide.shapes.title.text.strip()}"
+            except Exception:
+                pass
+
+            slide_elements = [f"#### [Slide {s_idx + 1}{slide_title}]"]
+
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    if shape == getattr(slide.shapes, "title", None):
+                        continue
+                    shape_paras = [p.text.strip() for p in shape.text_frame.paragraphs if p.text.strip()]
+                    if shape_paras:
+                        slide_elements.append("\n".join(f"- {p}" for p in shape_paras))
+
+            for shape in slide.shapes:
+                if shape.has_table:
+                    tbl = shape.table
+                    tbl_rows = []
+                    for row in tbl.rows:
+                        row_cells = [cell.text.strip().replace("\r\n", " ").replace("\n", " ").replace("|", "\\|") for cell in row.cells]
+                        tbl_rows.append("| " + " | ".join(row_cells) + " |")
+                    if tbl_rows:
+                        if len(tbl_rows) > 1:
+                            col_count = len(tbl.columns)
+                            tbl_rows.insert(1, "| " + " | ".join(["---"] * col_count) + " |")
+                        slide_elements.append("\n" + "\n".join(tbl_rows))
+
+            try:
+                if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                    notes = slide.notes_slide.notes_text_frame.text.strip()
+                    if notes:
+                        slide_elements.append(f"\n> **Speaker Notes:** {notes}")
+            except Exception:
+                pass
+
+            doc_parts.append("\n".join(slide_elements))
+
+        full_doc = "\n\n---\n\n".join(doc_parts)
+        summary = f"PowerPoint presentation with {num_slides} slide(s)"
+        if is_truncated:
+            summary += f" ({len(selected_slides)} sampled slides extracted)"
+
+        return {
+            "extracted_text": full_doc,
+            "summary": summary,
+            "metadata": {
+                "slides": num_slides,
+                "extracted_slides": len(selected_slides),
+                "is_truncated": is_truncated
+            },
+            "error": None
+        }
+    except Exception as e:
+        return {
+            "extracted_text": f"### PowerPoint: `{filename}`\n*(Error reading PowerPoint: {str(e)})*",
+            "summary": f"PowerPoint parse error: {str(e)}",
+            "metadata": {"error": str(e)},
+            "error": str(e)
+        }
+
+def extract_image(filename: str, file_bytes: bytes, size_kb: float) -> dict:
+    if Image is None:
+        return {
+            "extracted_text": f"[Image file: {filename} ({size_kb:,} KB) uploaded, but 'Pillow' is not installed]",
+            "summary": f"Image file ({size_kb} KB)",
+            "metadata": {"status": "pillow_missing"},
+            "error": "Pillow library not found"
+        }
+
+    try:
+        img = Image.open(io.BytesIO(file_bytes))
+        width, height = img.width, img.height
+        img_format = img.format or "IMAGE"
+        img_mode = img.mode
+
+        meta_lines = [
+            f"### Image Document: `{filename}`",
+            f"- **Dimensions:** {width:,} × {height:,} px | **Aspect Ratio:** {round(width / max(height, 1), 2)}:1",
+            f"- **Format:** {img_format} | **Color Mode:** {img_mode} | **File Size:** {size_kb:,} KB",
+        ]
+
+        exif_details = []
+        try:
+            exif = img.getexif()
+            if exif:
+                from PIL.ExifTags import TAGS
+                for tag_id, value in exif.items():
+                    tag_name = TAGS.get(tag_id, str(tag_id))
+                    if tag_name in ("Make", "Model", "DateTime", "Software", "Orientation"):
+                        exif_details.append(f"  - `{tag_name}`: {value}")
+        except Exception:
+            pass
+
+        if exif_details:
+            meta_lines.append("- **EXIF Metadata:**\n" + "\n".join(exif_details))
+
+        ocr_text = ""
+        ocr_status = "not_available"
+        if pytesseract is not None:
+            try:
+                ocr_img = img
+                if max(width, height) > 2200:
+                    scale = 2200.0 / max(width, height)
+                    new_w = int(width * scale)
+                    new_h = int(height * scale)
+                    resample_filter = getattr(Image, "Resampling", Image).LANCZOS
+                    ocr_img = img.resize((new_w, new_h), resample=resample_filter)
+
+                if ocr_img.mode in ("RGBA", "P", "LA", "CMYK"):
+                    ocr_img = ocr_img.convert("RGB")
+
+                ocr_text = pytesseract.image_to_string(ocr_img).strip()
+                ocr_status = "success" if ocr_text else "no_text_found"
+            except pytesseract.TesseractNotFoundError:
+                ocr_status = "tesseract_binary_not_found"
+            except Exception as oe:
+                ocr_status = f"ocr_error: {str(oe)}"
+
+        if ocr_text:
+            meta_lines.append(f"\n#### Extracted OCR Text:\n```text\n{ocr_text}\n```")
+            summary = f"Image ({width}×{height}px, {img_format}) with OCR text ({len(ocr_text.split()):,} words)"
+        elif ocr_status == "tesseract_binary_not_found":
+            meta_lines.append("\n*(Tesseract OCR engine is not configured in the host environment; visual dimensions and format metadata extracted.)*")
+            summary = f"Image ({width}×{height}px, {img_format}) [OCR engine unconfigured]"
+        else:
+            meta_lines.append("\n*(No textual content detected in image via OCR; visual dimensions and format metadata extracted.)*")
+            summary = f"Image ({width}×{height}px, {img_format})"
+
+        full_doc = "\n".join(meta_lines)
+        return {
+            "extracted_text": full_doc,
+            "summary": summary,
+            "metadata": {
+                "width": width,
+                "height": height,
+                "format": img_format,
+                "color_mode": img_mode,
+                "ocr_status": ocr_status,
+                "word_count": len(ocr_text.split()) if ocr_text else 0
+            },
+            "error": None
+        }
+    except Exception as e:
+        return {
+            "extracted_text": f"### Image: `{filename}`\n*(Error analyzing image: {str(e)})*",
+            "summary": f"Image parse error: {str(e)}",
+            "metadata": {"error": str(e)},
+            "error": str(e)
+        }
+
 def extract_content_from_file(filename: str, file_bytes: bytes) -> dict:
     """
-    Extracts text, data tables, or OCR content from uploaded files without Vector DB.
+    Extracts structured Markdown, data tables, or OCR content from uploaded files without Vector DB.
     Directly extracts and formats PDF, Word, Excel, PPTX, CSV, TXT, Code, and Images.
+    Implements smart truncation to handle massive 500+ page docs or 50,000+ row spreadsheets safely.
     """
     ext = os.path.splitext(filename)[1].lower()
     size_kb = round(len(file_bytes) / 1024, 2)
@@ -574,237 +1611,114 @@ def extract_content_from_file(filename: str, file_bytes: bytes) -> dict:
         "success": True,
         "extracted_text": "",
         "summary": "",
+        "metadata": {},
         "error": None
     }
 
     try:
         # 1. Plain text & Code files
-        text_extensions = {
-            ".txt", ".md", ".py", ".js", ".jsx", ".ts", ".tsx", ".html",
-            ".css", ".json", ".yaml", ".yml", ".xml", ".sql", ".sh",
-            ".bat", ".env", ".c", ".cpp", ".h", ".java", ".go", ".rs",
-            ".php", ".rb", ".ini", ".conf", ".log"
-        }
-        if ext in text_extensions:
-            try:
-                text = file_bytes.decode("utf-8")
-            except UnicodeDecodeError:
-                text = file_bytes.decode("latin-1", errors="replace")
-            result["extracted_text"] = text
-            result["summary"] = f"Text/code file ({len(text)} characters, {len(text.splitlines())} lines)"
+        if ext in CODE_LANG_MAP or filename.lower() in ("dockerfile", "makefile", "license", "readme", ".gitignore", ".env"):
+            res = extract_text_code(filename, file_bytes, size_kb)
+            result.update(res)
             return result
 
-        # 2. PDF Files (.pdf)
+        # 2. PDF Documents (.pdf)
         if ext == ".pdf":
-            if pypdf is not None:
-                try:
-                    reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-                    num_pages = len(reader.pages)
-                    pages_content = []
-                    for p_idx, page in enumerate(reader.pages):
-                        p_text = page.extract_text() or ""
-                        if p_text.strip():
-                            pages_content.append(f"--- [Page {p_idx + 1}/{num_pages}] ---\n{p_text.strip()}")
-                    combined_text = "\n\n".join(pages_content)
-                    result["extracted_text"] = combined_text
-                    result["summary"] = f"PDF document with {num_pages} page(s) ({len(combined_text.split())} words)"
-                    return result
-                except Exception as pe:
-                    result["extracted_text"] = f"[Error reading PDF {filename}: {str(pe)}]"
-                    result["error"] = str(pe)
-                    return result
-            else:
-                result["extracted_text"] = f"[PDF file: {filename} uploaded, but 'pypdf' library is not available in environment]"
-                result["summary"] = "PDF document (parser pending install)"
-                result["error"] = "pypdf library not found"
-                return result
+            res = extract_pdf(filename, file_bytes, size_kb)
+            result.update(res)
+            return result
 
         # 3. Word Documents (.docx, .doc)
         if ext in (".docx", ".doc"):
-            if docx is not None:
-                try:
-                    doc = docx.Document(io.BytesIO(file_bytes))
-                    doc_parts = []
-                    for p in doc.paragraphs:
-                        if p.text.strip():
-                            doc_parts.append(p.text.strip())
-                    for t_idx, table in enumerate(doc.tables):
-                        table_rows = []
-                        for row in table.rows:
-                            row_cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
-                            table_rows.append("| " + " | ".join(row_cells) + " |")
-                        if table_rows:
-                            if len(table_rows) > 1:
-                                col_count = len(table.rows[0].cells)
-                                table_rows.insert(1, "| " + " | ".join(["---"] * col_count) + " |")
-                            doc_parts.append(f"\n[Table {t_idx + 1}]\n" + "\n".join(table_rows))
-                    
-                    combined_text = "\n\n".join(doc_parts)
-                    result["extracted_text"] = combined_text
-                    result["summary"] = f"Word document ({len(doc.paragraphs)} paragraphs, {len(doc.tables)} tables)"
-                    return result
-                except Exception as de:
-                    result["extracted_text"] = f"[Error reading Word document {filename}: {str(de)}]"
-                    result["error"] = str(de)
-                    return result
-            else:
-                result["extracted_text"] = f"[Word file: {filename} uploaded, but 'python-docx' is not available]"
-                result["summary"] = "Word document (parser pending install)"
-                result["error"] = "python-docx library not found"
-                return result
+            res = extract_word(filename, file_bytes, size_kb)
+            result.update(res)
+            return result
 
-        # 4. Excel & Spreadsheets (.xlsx, .xls, .csv, .tsv)
+        # 4. Spreadsheets (.xlsx, .xls, .csv, .tsv)
         if ext in (".xlsx", ".xls", ".csv", ".tsv"):
-            try:
-                if pd is not None:
-                    if ext == ".csv":
-                        df = pd.read_csv(io.BytesIO(file_bytes))
-                        sheets = {"CSV_Data": df}
-                    elif ext == ".tsv":
-                        df = pd.read_csv(io.BytesIO(file_bytes), sep="\t")
-                        sheets = {"TSV_Data": df}
-                    else:
-                        sheets = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None)
-
-                    sheet_texts = []
-                    for s_name, sheet_df in sheets.items():
-                        total_rows, total_cols = sheet_df.shape
-                        preview_df = sheet_df.head(100)
-                        try:
-                            md_table = preview_df.to_markdown(index=False)
-                        except Exception:
-                            md_table = preview_df.to_string(index=False)
-                        desc = f"### Sheet: {s_name} (Total Rows: {total_rows}, Columns: {total_cols})\n"
-                        desc += f"Columns: {', '.join(str(c) for c in sheet_df.columns)}\n\n"
-                        desc += md_table
-                        if total_rows > 100:
-                            desc += f"\n\n*(Showing preview of first 100 rows out of {total_rows} total rows)*"
-                        sheet_texts.append(desc)
-
-                    combined_text = "\n\n---\n\n".join(sheet_texts)
-                    result["extracted_text"] = combined_text
-                    result["summary"] = f"Spreadsheet with {len(sheets)} sheet(s)"
-                    return result
-                elif ext in (".csv", ".tsv"):
-                    text = file_bytes.decode("utf-8", errors="replace")
-                    result["extracted_text"] = text
-                    result["summary"] = f"CSV/TSV table ({len(text.splitlines())} lines)"
-                    return result
-                else:
-                    result["extracted_text"] = f"[Excel file: {filename} uploaded, but 'pandas/openpyxl' is not available]"
-                    result["summary"] = "Excel spreadsheet"
-                    result["error"] = "pandas/openpyxl library not found"
-                    return result
-            except Exception as xe:
-                result["extracted_text"] = f"[Error reading spreadsheet {filename}: {str(xe)}]"
-                result["error"] = str(xe)
-                return result
+            res = extract_spreadsheet(filename, file_bytes, size_kb)
+            result.update(res)
+            return result
 
         # 5. PowerPoint Presentations (.pptx)
         if ext == ".pptx":
-            if Presentation is not None:
-                try:
-                    prs = Presentation(io.BytesIO(file_bytes))
-                    slide_texts = []
-                    for s_idx, slide in enumerate(prs.slides):
-                        texts = []
-                        for shape in slide.shapes:
-                            if shape.has_text_frame:
-                                for p in shape.text_frame.paragraphs:
-                                    if p.text.strip():
-                                        texts.append(p.text.strip())
-                        if texts:
-                            slide_texts.append(f"--- [Slide {s_idx + 1}] ---\n" + "\n".join(texts))
-                    combined_text = "\n\n".join(slide_texts)
-                    result["extracted_text"] = combined_text
-                    result["summary"] = f"PowerPoint presentation with {len(prs.slides)} slide(s)"
-                    return result
-                except Exception as ppe:
-                    result["extracted_text"] = f"[Error reading PowerPoint {filename}: {str(ppe)}]"
-                    result["error"] = str(ppe)
-                    return result
-            else:
-                result["extracted_text"] = f"[PowerPoint file: {filename} uploaded, but 'python-pptx' is not available]"
-                result["summary"] = "PowerPoint presentation"
-                result["error"] = "python-pptx library not found"
-                return result
+            res = extract_powerpoint(filename, file_bytes, size_kb)
+            result.update(res)
+            return result
 
-        # 6. Images (.png, .jpg, .jpeg, .webp, .bmp, .gif)
-        if ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"):
-            img_desc = f"[Attached Image File: {filename} (Size: {size_kb} KB)]"
-            if Image is not None:
-                try:
-                    img = Image.open(io.BytesIO(file_bytes))
-                    img_desc += f"\nImage Dimensions: {img.width}x{img.height}px | Format: {img.format} | Color Mode: {img.mode}"
-                    
-                    ocr_text = ""
-                    if pytesseract is not None:
-                        try:
-                            ocr_text = pytesseract.image_to_string(img).strip()
-                        except Exception:
-                            ocr_text = ""
-                    
-                    if ocr_text:
-                        img_desc += f"\n\n[Extracted OCR Text from Image]:\n{ocr_text}"
-                        result["summary"] = f"Image ({img.width}x{img.height}px) with OCR text ({len(ocr_text.split())} words)"
-                    else:
-                        img_desc += "\n\n(No textual content detected via OCR; image metadata extracted.)"
-                        result["summary"] = f"Image ({img.width}x{img.height}px)"
-                    
-                    result["extracted_text"] = img_desc
-                    return result
-                except Exception as ie:
-                    result["extracted_text"] = f"[Image file: {filename} ({size_kb} KB)]"
-                    result["summary"] = f"Image file ({size_kb} KB)"
-                    return result
-            else:
-                result["extracted_text"] = f"[Image file: {filename} ({size_kb} KB)]"
-                result["summary"] = f"Image file ({size_kb} KB)"
+        # 6. Images (.png, .jpg, .jpeg, .webp, .bmp, .gif, .tiff, .tif, .ico, .svg)
+        if ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tiff", ".tif", ".ico", ".svg"):
+            if ext == ".svg":
+                res = extract_text_code(filename, file_bytes, size_kb)
+                result.update(res)
                 return result
+            res = extract_image(filename, file_bytes, size_kb)
+            result.update(res)
+            return result
 
         # 7. Audio / Video files
         if ext in (".mp3", ".wav", ".m4a", ".ogg", ".flac", ".mp4", ".mkv", ".webm", ".avi", ".mov"):
             media_type = "Audio" if ext in (".mp3", ".wav", ".m4a", ".ogg", ".flac") else "Video"
             desc = (
-                f"[{media_type} File Attached: {filename} (Format: {ext.upper()[1:]}, Size: {size_kb} KB)]\n"
+                f"### {media_type} File: `{filename}`\n"
+                f"- **Format:** {ext.upper()[1:]} | **Size:** {size_kb:,} KB\n\n"
                 f"Direct {media_type.lower()} file metadata parsed without vector database. "
                 f"You may ask questions, transcription guidance, or processing instructions regarding this media."
             )
             result["extracted_text"] = desc
-            result["summary"] = f"{media_type} file ({size_kb} KB)"
+            result["summary"] = f"{media_type} file ({size_kb:,} KB)"
+            result["metadata"] = {"media_type": media_type, "format": ext}
             return result
 
-        # 8. Generic binary fallback
-        try:
-            raw_text = file_bytes.decode("utf-8", errors="ignore")
-            if len(raw_text.strip()) > 20:
-                result["extracted_text"] = raw_text
-                result["summary"] = f"Decoded file content ({len(raw_text)} chars)"
-                return result
-        except Exception:
-            pass
+        # 8. Generic binary / unknown fallback
+        raw_text = decode_text_bytes(file_bytes)
+        if len(raw_text.strip()) > 30:
+            trunc_text, is_trunc = truncate_text_content(raw_text, filename)
+            result["extracted_text"] = f"### File: `{filename}` (Decoded Text)\n- **Size:** {size_kb:,} KB\n\n```text\n{trunc_text}\n```"
+            result["summary"] = f"Decoded file content ({len(raw_text):,} chars)"
+            result["metadata"] = {"is_truncated": is_trunc}
+            return result
 
-        result["extracted_text"] = f"[File Attached: {filename} (Size: {size_kb} KB, Type: {ext})]"
-        result["summary"] = f"Attached file ({size_kb} KB)"
+        result["extracted_text"] = f"### Attached Binary File: `{filename}`\n- **Size:** {size_kb:,} KB | **Type:** `{ext}`"
+        result["summary"] = f"Attached file ({size_kb:,} KB)"
+        result["metadata"] = {"binary": True}
         return result
 
     except Exception as e:
-        logger.error(f"Error parsing file {filename}: {e}")
+        logger.error(f"Error parsing file {filename}: {e}", exc_info=True)
         result["success"] = False
         result["error"] = str(e)
-        result["extracted_text"] = f"[Error reading file {filename}: {str(e)}]"
+        result["extracted_text"] = f"### File Error: `{filename}`\n*(Error extracting file content: {str(e)})*"
         result["summary"] = f"File error: {str(e)}"
         return result
 
 @app.post("/v1/files/extract")
-async def extract_file_endpoint(file: UploadFile = File(...)):
+async def extract_file_endpoint(
+    file: UploadFile = File(...),
+    session_id: Optional[str] = Form(None)
+):
     """
     Extracts text, data tables, or OCR content from uploaded files without Vector DB.
     Supports PDF, Word, Excel, PPTX, CSV, TXT, Code, Images, etc.
+    Optionally pins extracted content into the session's short-term working memory.
     """
     try:
         content_bytes = await file.read()
         res = extract_content_from_file(file.filename or "unknown_file", content_bytes)
+
+        # Pin extracted document to session working memory if session_id provided
+        if session_id and res.get("success", True):
+            sess = session_memory_store.get_or_create(session_id)
+            pinned_doc = sess.pin_document(
+                filename=res.get("filename", file.filename or "uploaded_file"),
+                extracted_text=res.get("extracted_text", ""),
+                summary=res.get("summary", ""),
+                size_kb=res.get("size_kb", 0.0)
+            )
+            res["session_id"] = session_id
+            res["pinned_to_session"] = True
+            res["doc_id"] = pinned_doc.doc_id
+
         return JSONResponse(status_code=200, content=res)
     except Exception as e:
         logger.error(f"Error in /v1/files/extract: {e}")
@@ -815,11 +1729,12 @@ async def chat_upload_and_complete(
     file: UploadFile = File(...),
     prompt: Optional[str] = Form(None),
     max_tokens: Optional[int] = Form(1024),
-    temperature: Optional[float] = Form(0.7)
+    temperature: Optional[float] = Form(0.7),
+    session_id: Optional[str] = Form(None)
 ):
     """
     Convenience multipart endpoint to upload a file + question together in one request.
-    Extracts file content, constructs the prompt, and returns the completion.
+    Extracts file content, pins to short-term working memory, constructs prompt, and returns completion.
     """
     if model is None:
         try:
@@ -829,31 +1744,46 @@ async def chat_upload_and_complete(
 
     content_bytes = await file.read()
     extracted = extract_content_from_file(file.filename or "file", content_bytes)
-    
+
     file_context = extracted.get("extracted_text", "")
     user_prompt = (prompt or "Please analyze and summarize this attached file.").strip()
-    
+
+    # Session Short-Term Working Memory persistence
+    target_session_id = (session_id or "").strip() or f"sess_{uuid.uuid4().hex[:12]}"
+    sess = session_memory_store.get_or_create(target_session_id)
+    if extracted.get("success", True):
+        sess.pin_document(
+            filename=extracted["filename"],
+            extracted_text=file_context,
+            summary=extracted.get("summary", ""),
+            size_kb=extracted.get("size_kb", 0.0)
+        )
+    sess.add_message("user", user_prompt)
+
     combined_user_content = (
         f"[ATTACHED FILE: {extracted['filename']} ({extracted['summary']})]\n"
         f"--- BEGIN FILE CONTENT ---\n{file_context}\n--- END FILE CONTENT ---\n\n"
         f"User Query:\n{user_prompt}"
     )
-    
+
     messages = [
         Message(role="system", content=DEFAULT_SYSTEM_PROMPT),
         Message(role="user", content=combined_user_content)
     ]
     prompt_text = construct_chatml_prompt(messages)
-    
+
     generated = generate_local(
         prompt_text=prompt_text,
         max_tokens=max_tokens or 1024,
         temperature=temperature or 0.7,
         top_p=0.95
     )
-    
+
+    sess.add_message("assistant", generated)
+
     return {
         "status": "success",
+        "session_id": target_session_id,
         "file": {
             "filename": extracted["filename"],
             "size_kb": extracted["size_kb"],
@@ -861,6 +1791,43 @@ async def chat_upload_and_complete(
         },
         "query": user_prompt,
         "completion": generated
+    }
+
+# --- Short-Term Working Memory Management Endpoints ---
+
+@app.get("/v1/sessions")
+async def list_active_sessions():
+    """Returns a list of all active sessions in the Short-Term Memory store."""
+    sessions = session_memory_store.list_sessions()
+    return {
+        "status": "success",
+        "active_session_count": len(sessions),
+        "sessions": sessions
+    }
+
+@app.get("/v1/sessions/{session_id}/memory")
+async def get_session_memory(session_id: str, include_doc_text: Optional[bool] = False):
+    """
+    Retrieves the short-term memory state for a session, including rolling buffer
+    turns and pinned document working memory.
+    """
+    sess = session_memory_store.get_session(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found or expired.")
+    return JSONResponse(status_code=200, content=sess.to_dict(include_doc_text=include_doc_text))
+
+@app.delete("/v1/sessions/{session_id}/memory")
+async def delete_session_memory(session_id: str):
+    """
+    Clears the short-term memory (rolling buffer and pinned documents) for a session.
+    """
+    deleted = session_memory_store.delete_session(session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found or already deleted.")
+    return {
+        "status": "deleted",
+        "session_id": session_id,
+        "message": f"Short-term working memory for session '{session_id}' successfully cleared."
     }
 
 # --- Global Exception Handler (Prevents blank 500 errors) ---
@@ -2320,6 +3287,9 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       if (confirm("Are you sure you want to clear conversation history?")) {
         if (isGenerating && abortController) abortController.abort();
         closeSidebar();
+        if (currentSessionId) {
+          fetch(`/v1/sessions/${encodeURIComponent(currentSessionId)}/memory`, { method: "DELETE" }).catch(() => {});
+        }
         localStorage.removeItem("hermes_chat_sessions");
         startNewSession();
       }
@@ -2488,6 +3458,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
           try {
             const formData = new FormData();
             formData.append("file", attachedSnapshot.file);
+            formData.append("session_id", currentSessionId);
             const extRes = await fetch("/v1/files/extract", {
               method: "POST",
               body: formData,
@@ -2521,6 +3492,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
 
         const payload = {
           model: "NousResearch/Hermes-3-Llama-3.1-8B",
+          session_id: currentSessionId,
           messages: [
             { role: "system", content: "You are a Lead Co-Founder & Senior Technical Architect. You possess world-class expertise in distributed systems, full-stack software engineering, pragmatic AI engineering, and comprehensive document analysis. When analyzing attached documents, spreadsheets, code, or images, provide precise, structured, and insightful answers." },
             ...apiMessages
@@ -2681,6 +3653,7 @@ async def root_view(request: Request):
             "backend": "ZeroGPU Nvidia A100",
             "endpoints": {
                 "chat_completions": f"{HF_SPACE_URL}/v1/chat/completions",
+                "sessions": f"{HF_SPACE_URL}/v1/sessions",
                 "health": f"{HF_SPACE_URL}/health",
                 "warmup": f"{HF_SPACE_URL}/v1/warmup",
                 "models": f"{HF_SPACE_URL}/v1/models",
