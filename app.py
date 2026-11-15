@@ -117,22 +117,18 @@ HF_SPACE_URL = (
 
 START_TIME = time.time()
 
-# --- Default Hardened Persona ---
-DEFAULT_SYSTEM_PROMPT = (
-    "You are a Lead Co-Founder & Senior Technical Architect. "
-    "You possess world-class expertise in distributed systems, full-stack software engineering, "
-    "and pragmatic AI engineering.\n\n"
-    "Core Directives & Behavioral Guidelines:\n"
-    "1. Production Engineering: Write production-ready, clean, scalable, and secure code. "
-    "Always handle edge cases, error states, and security vulnerabilities.\n"
-    "2. Anti-Laziness: Never provide placeholder comments like '// TODO', 'Implement here', "
-    "or truncate code blocks. Provide complete, fully-implemented, copy-paste ready solutions.\n"
-    "3. Conversational Tone: When conversational interaction or explanations are needed, "
-    "communicate in a natural, sharp, technical Hinglish (blend of English & Hindi) or direct English, "
-    "acting as an elite co-founder who is focused, decisive, and highly supportive.\n"
-    "4. Tool & Agentic Execution: If tool calls or function invocations are requested, "
-    "format them cleanly within <tool_call> and </tool_call> tags without omitting arguments."
-)
+# --- Dynamic Persona Configuration (Private & Loaded Dynamically from .env) ---
+def get_default_system_prompt() -> str:
+    """Dynamically retrieves Somi persona from environment variable; stays private and never committed to code."""
+    prompt = os.getenv("SYSTEM_PROMPT", "").strip()
+    if prompt.startswith('"') and prompt.endswith('"') and len(prompt) >= 2:
+        prompt = prompt[1:-1].strip()
+    return prompt or (
+        "You are Somi, an elite AI Co-Founder, Technical Partner, and Strategist to Amit. "
+        "You deliver sharp, actionable, production-ready solutions in natural Hinglish/English with zero fluff."
+    )
+
+DEFAULT_SYSTEM_PROMPT = get_default_system_prompt()
 
 # --- Global Model & Tokenizer Instances ---
 tokenizer = None
@@ -242,6 +238,7 @@ def load_local_model():
                 logger.info(f"   Note on SDPA mount ({attn_err}); loading with default attention...")
                 model = AutoModelForCausalLM.from_pretrained(**load_kwargs)
 
+            model.eval()
             # Ensure KV cache is enabled
             if hasattr(model, "generation_config") and model.generation_config is not None:
                 model.generation_config.use_cache = True
@@ -289,41 +286,22 @@ class ChatCompletionRequest(BaseModel):
     stop: Optional[Union[str, List[str]]] = None
     session_id: Optional[str] = None
 
-class ModelPermission(BaseModel):
-    id: str = "modelperm-" + uuid.uuid4().hex[:8]
-    object: str = "model_permission"
-    created: int = int(START_TIME)
-    allow_create_engine: bool = False
-    allow_sampling: bool = True
-    allow_logprobs: bool = True
-    allow_search_indices: bool = False
-    allow_view: bool = True
-    allow_fine_tuning: bool = False
-    organization: str = "*"
-    group: Optional[str] = None
-    is_blocking: bool = False
 
-class ModelCard(BaseModel):
-    id: str
-    object: str = "model"
-    created: int = int(START_TIME)
-    owned_by: str = "NousResearch"
-    permission: List[ModelPermission] = [ModelPermission()]
-    root: str
-    parent: Optional[str] = None
 
 # --- Helper Functions ---
-def construct_chatml_prompt(messages: List[Message], default_system: str = DEFAULT_SYSTEM_PROMPT) -> str:
+def construct_chatml_prompt(messages: List[Message], default_system: Optional[str] = None) -> str:
     """
     Constructs strict Hermes-3 compliant ChatML prompt:
     <|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n
     Supports system, user, assistant, and tool roles with optional names.
+    Dynamically falls back to get_default_system_prompt() to load Somi persona.
     """
     has_system = any(m.role.strip().lower() == "system" for m in messages if m.role)
     parts = []
 
     if not has_system:
-        parts.append(f"<|im_start|>system\n{default_system.strip()}<|im_end|>\n")
+        system_text = default_system or get_default_system_prompt()
+        parts.append(f"<|im_start|>system\n{system_text.strip()}<|im_end|>\n")
 
     for msg in messages:
         role = (msg.role or "user").strip().lower()
@@ -487,7 +465,11 @@ def stream_local_tokens(
     else:
         gen_kwargs["do_sample"] = False
 
-    thread = Thread(target=model.generate, kwargs=gen_kwargs)
+    def _run_stream_worker():
+        with torch.inference_mode():
+            model.generate(**gen_kwargs)
+
+    thread = Thread(target=_run_stream_worker, daemon=True)
     thread.start()
 
     stop_markers = ["<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<|im_start|>"]
@@ -523,10 +505,13 @@ async def startup_event():
         try:
             logger.info("Background preloading model into memory...")
             load_local_model()
-            logger.info("Background model loading complete! Pre-warming JIT kernels...")
+            logger.info("Background model loading complete! Pre-warming JIT kernels & streaming pipeline for minimum TTFT...")
             try:
-                generate_local("<|im_start|>user\nping<|im_end|>\n<|im_start|>assistant\n", 2, 0.5, 0.9)
-                logger.info("JIT kernels pre-warmed successfully!")
+                dummy_prompt = "<|im_start|>user\nping<|im_end|>\n<|im_start|>assistant\n"
+                generate_local(dummy_prompt, 2, 0.5, 0.9)
+                for _ in stream_local_tokens(dummy_prompt, 2, 0.5, 0.9):
+                    pass
+                logger.info("JIT kernels and streaming pipelines pre-warmed successfully!")
             except Exception as w_err:
                 logger.warning(f"Startup warmup note: {w_err}")
         except Exception as e:
@@ -764,9 +749,10 @@ async def chat_completions(req: ChatCompletionRequest):
             event_generator(),
             media_type="text/event-stream",
             headers={
-                "Cache-Control": "no-cache",
+                "Cache-Control": "no-cache, no-transform",
                 "Connection": "keep-alive",
-                "X-Accel-Buffering": "no"
+                "X-Accel-Buffering": "no",
+                "Content-Type": "text/event-stream; charset=utf-8"
             }
         )
 
@@ -1845,7 +1831,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>GenAI | Hermes-3 8B Architecture</title>
+  <title>Somi • AI Co-Founder | Hermes-3 8B Architecture</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -2852,7 +2838,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
         <!-- Drawer Header for Mobile -->
         <div class="sidebar-drawer-header">
           <div class="sidebar-drawer-title">
-            <span>⚡ GenAI</span>
+            <span>⚡ Somi • AI Co-Founder</span>
           </div>
           <button class="drawer-close-btn" id="closeDrawerBtn" title="Close Drawer">✕</button>
         </div>
@@ -2889,8 +2875,8 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       <div class="profile-card">
         <div class="profile-avatar">⚡</div>
         <div class="profile-info">
-          <div class="profile-name">Hermes-3 8B</div>
-          <div class="profile-badge">Nvidia A100 ZeroGPU</div>
+          <div class="profile-name">Somi • AI Co-Founder</div>
+          <div class="profile-badge">Hermes-3 8B • A100</div>
         </div>
       </div>
     </aside>
@@ -2902,7 +2888,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       <header class="mobile-header">
         <button class="mobile-nav-toggle" id="openDrawerBtn" title="Open History">☰</button>
         <div class="mobile-brand">
-          <span>GenAI Hermes-3</span>
+          <span>Somi • AI Co-Founder</span>
           <span class="badge">A100</span>
         </div>
         <div class="mobile-actions">
@@ -2916,7 +2902,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
 
         <!-- Welcome Hero View (Matching GenAI Screenshot) -->
         <div class="hero-view" id="heroView">
-          <h1 class="hero-title">Start writing with GenAI</h1>
+          <h1 class="hero-title">Start collaborating with Somi • AI Co-Founder</h1>
 
           <div class="prompt-grid">
             <div class="prompt-card" onclick="triggerPrompt('Write an engaging technical social media post about distributed systems.')">
@@ -3237,24 +3223,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       historyList.innerHTML = "";
 
       if (sessions.length === 0) {
-        const demoTitles = [
-          "Stress & Anxiety Everytime",
-          "Not Having Enough Money",
-          "Mental Health",
-          "Food Industry case study",
-          "Team Management Plan",
-          "Form validation code"
-        ];
-        demoTitles.forEach(title => {
-          const item = document.createElement("div");
-          item.className = "history-item";
-          item.innerHTML = `<span class="chat-bubble-icon">💬</span><span>${title}</span>`;
-          item.onclick = () => {
-            closeSidebar();
-            triggerPrompt("Tell me more about " + title);
-          };
-          historyList.appendChild(item);
-        });
+        historyList.innerHTML = `<div style="padding: 14px 12px; font-size: 0.82rem; color: var(--text-muted); text-align: center;">No saved conversations yet</div>`;
         return;
       }
 
@@ -3459,11 +3428,14 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
             const formData = new FormData();
             formData.append("file", attachedSnapshot.file);
             formData.append("session_id", currentSessionId);
-            const extRes = await fetch("/v1/files/extract", {
-              method: "POST",
-              body: formData,
-              signal: abortController.signal
-            });
+            const [extRes] = await Promise.all([
+              fetch("/v1/files/extract", {
+                method: "POST",
+                body: formData,
+                signal: abortController.signal
+              }),
+              Promise.resolve().then(() => saveSessions(sessions))
+            ]);
             if (extRes.ok) {
               const fileData = await extRes.json();
               injectedUserContent = `[ATTACHED FILE: ${fileData.filename} (${fileData.summary})]\n--- BEGIN FILE CONTENT ---\n${fileData.extracted_text}\n--- END FILE CONTENT ---\n\nUser Question:\n${userDisplayPrompt}`;
@@ -3477,12 +3449,12 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
               <span class="dot-pulse"></span>
               <span class="dot-pulse"></span>
               <span class="dot-pulse"></span>
-              <span>Hermes-3 is analyzing document...</span>
+              <span>Somi is analyzing document...</span>
             </div>
           `;
         }
 
-        // Build messages payload for Hermes-3
+        // Build messages payload for Hermes-3 (dynamically uses private Somi persona on backend)
         const apiMessages = conversation.map((msg, idx) => {
           if (idx === conversation.length - 1 && msg.role === "user") {
             return { role: "user", content: injectedUserContent };
@@ -3493,10 +3465,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
         const payload = {
           model: "NousResearch/Hermes-3-Llama-3.1-8B",
           session_id: currentSessionId,
-          messages: [
-            { role: "system", content: "You are a Lead Co-Founder & Senior Technical Architect. You possess world-class expertise in distributed systems, full-stack software engineering, pragmatic AI engineering, and comprehensive document analysis. When analyzing attached documents, spreadsheets, code, or images, provide precise, structured, and insightful answers." },
-            ...apiMessages
-          ],
+          messages: apiMessages,
           temperature: 0.7,
           max_tokens: 1536,
           stream: true
@@ -3542,15 +3511,19 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
                 if (delta) {
                   fullResponse += delta;
                   tokenCount++;
-                  renderStreamedContent(contentEl, fullResponse, true);
-                  chatScroll.scrollTop = chatScroll.scrollHeight;
+                  scheduleBatchedStreamRender(contentEl, fullResponse);
                 }
               } catch (err) {}
             }
           }
         }
 
+        if (renderRafId) {
+          cancelAnimationFrame(renderRafId);
+          renderRafId = null;
+        }
         renderStreamedContent(contentEl, fullResponse, false);
+        chatScroll.scrollTop = chatScroll.scrollHeight;
         conversation.push({ role: "assistant", content: fullResponse });
 
         sess.messages = conversation;
@@ -3558,16 +3531,24 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
 
         const totalDuration = ((performance.now() - startTime) / 1000).toFixed(2);
         const tokPerSec = tokenCount > 0 ? (tokenCount / Math.max(totalDuration, 0.1)).toFixed(1) : 0;
-        metaEl.textContent = `⚡ ${totalDuration}s • ${tokPerSec} tok/s • ZeroGPU A100`;
+        metaEl.textContent = `⚡ ${totalDuration}s • ${tokPerSec} tok/s • Somi A100`;
 
       } catch (err) {
         if (err.name === 'AbortError') {
+          if (renderRafId) {
+            cancelAnimationFrame(renderRafId);
+            renderRafId = null;
+          }
           renderStreamedContent(contentEl, fullResponse, false);
           metaEl.textContent = "⚠️ Stopped by user.";
         } else {
           contentEl.innerHTML = `<span style="color: #ef4444;">❌ Error: ${err.message}</span>`;
         }
       } finally {
+        if (renderRafId) {
+          cancelAnimationFrame(renderRafId);
+          renderRafId = null;
+        }
         isGenerating = false;
         setButtonState(false);
         abortController = null;
@@ -3575,8 +3556,22 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       }
     }
 
+    let renderRafId = null;
+    let pendingStreamText = "";
+
+    function scheduleBatchedStreamRender(el, text) {
+      pendingStreamText = text;
+      if (!renderRafId) {
+        renderRafId = requestAnimationFrame(() => {
+          renderRafId = null;
+          renderStreamedContent(el, pendingStreamText, true);
+          chatScroll.scrollTop = chatScroll.scrollHeight;
+        });
+      }
+    }
+
     function renderStreamedContent(el, text, isStreaming) {
-      let html = marked.parse(text);
+      let html = marked.parse(text || "");
       if (isStreaming) {
         html += `<span class="typing-cursor"></span>`;
       }
@@ -3596,7 +3591,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
           <span class="dot-pulse"></span>
           <span class="dot-pulse"></span>
           <span class="dot-pulse"></span>
-          <span>GenAI is writing...</span>
+          <span>Somi is thinking...</span>
         </div>
       `;
 
