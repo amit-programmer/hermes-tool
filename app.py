@@ -3012,7 +3012,6 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
     const pillInputBox = document.getElementById("pillInputBox");
 
     // Theme Elements
-    const themeToggleBtn = document.getElementById("themeToggleBtn");
     const mobileThemeToggleBtn = document.getElementById("mobileThemeToggleBtn");
     const lightThemeOption = document.getElementById("lightThemeOption");
     const darkThemeOption = document.getElementById("darkThemeOption");
@@ -3022,10 +3021,6 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       const isDark = theme === "dark";
       if (isDark) {
         document.body.classList.add("dark-theme");
-        if (themeToggleBtn) {
-          themeToggleBtn.innerHTML = "☀️";
-          themeToggleBtn.title = "Switch to Light Mode";
-        }
         if (mobileThemeToggleBtn) {
           mobileThemeToggleBtn.innerHTML = "☀️";
           mobileThemeToggleBtn.title = "Switch to Light Mode";
@@ -3034,10 +3029,6 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
         if (lightThemeOption) lightThemeOption.classList.remove("active");
       } else {
         document.body.classList.remove("dark-theme");
-        if (themeToggleBtn) {
-          themeToggleBtn.innerHTML = "🌙";
-          themeToggleBtn.title = "Switch to Dark Mode";
-        }
         if (mobileThemeToggleBtn) {
           mobileThemeToggleBtn.innerHTML = "🌙";
           mobileThemeToggleBtn.title = "Switch to Dark Mode";
@@ -3053,7 +3044,6 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
       applyTheme(current === "dark" ? "light" : "dark");
     }
 
-    if (themeToggleBtn) themeToggleBtn.addEventListener("click", toggleTheme);
     if (mobileThemeToggleBtn) mobileThemeToggleBtn.addEventListener("click", toggleTheme);
     if (lightThemeOption) lightThemeOption.addEventListener("click", () => applyTheme("light"));
     if (darkThemeOption) darkThemeOption.addEventListener("click", () => applyTheme("dark"));
