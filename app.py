@@ -120,7 +120,8 @@ def _zerogpu_startup():
 
 # --- Configuration ---
 MODEL_ID = os.getenv("MODEL_ID", "NousResearch/Hermes-3-Llama-3.1-8B")
-HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HF_ACCESS_TOKEN")
+HF_TOKEN = (os.getenv("HF_TOKEN") or os.getenv("HF_ACCESS_TOKEN") or "").strip()
+AUTH_TOKEN = HF_TOKEN if HF_TOKEN else None
 HF_SPACE_URL = (
     os.getenv("HF_SPACE_URL")
     or os.getenv("GATEWAY_URL")
@@ -131,7 +132,7 @@ START_TIME = time.time()
 
 # --- Dynamic Persona Configuration (Private & Loaded Dynamically from .env) ---
 def get_default_system_prompt() -> str:
-    """Dynamically retrieves Somi persona from environment variable; stays private and never committed to code."""
+    """Dynamically retrieves Somi persona from environment variable; safe fallback if not set in Secrets."""
     prompt = os.getenv("SYSTEM_PROMPT", "").strip()
     if prompt.startswith('"') and prompt.endswith('"') and len(prompt) >= 2:
         prompt = prompt[1:-1].strip()
@@ -195,10 +196,10 @@ def get_eos_token_ids(tok, custom_stops: Optional[List[str]] = None) -> List[int
 
     return list(stop_ids)
 
-@spaces.GPU(duration=180)
 def load_local_model():
     """
-    Downloads and loads the model and tokenizer into memory with thread-safety inside @spaces.GPU.
+    Downloads and loads the model and tokenizer into memory with thread-safety.
+    Called inside @spaces.GPU inference context (zero nested decorator conflict).
     Uses 4-bit quantization (BitsAndBytes NF4, ~5GB VRAM) on CUDA/ZeroGPU for optimal efficiency.
     """
     global tokenizer, model, is_model_loading, model_load_error
@@ -214,7 +215,7 @@ def load_local_model():
             logger.info(f"1. Downloading / Loading Tokenizer for: {MODEL_ID}...")
             tokenizer = AutoTokenizer.from_pretrained(
                 MODEL_ID,
-                token=HF_TOKEN,
+                token=AUTH_TOKEN,
                 trust_remote_code=True
             )
             if tokenizer.pad_token is None:
@@ -234,7 +235,7 @@ def load_local_model():
 
             load_kwargs = {
                 "pretrained_model_name_or_path": MODEL_ID,
-                "token": HF_TOKEN,
+                "token": AUTH_TOKEN,
                 "quantization_config": bnb_config,
                 "device_map": "auto",
                 "low_cpu_mem_usage": True,
@@ -271,7 +272,10 @@ def load_local_model():
         except Exception as e:
             model_load_error = str(e)
             is_model_loading = False
-            logger.error(f"Failed to load model into memory: {e}")
+            import traceback
+            traceback.print_exc()
+            logger.error(f"Failed to load model into memory: {e}\n{traceback.format_exc()}")
+            raise e
             raise e
 
 # --- FastAPI App Initialization ---
@@ -1871,13 +1875,16 @@ async def delete_session_memory(session_id: str):
         "message": f"Short-term working memory for session '{session_id}' successfully cleared."
     }
 
-# --- Global Exception Handler (Prevents blank 500 errors) ---
+# --- Global Exception Handler (Prints traceback to terminal/logs and returns clean JSON) ---
 @app.exception_handler(Exception)
 async def all_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Error processing {request.method} {request.url.path}: {exc}")
+    import traceback
+    traceback.print_exc()
+    error_tb = traceback.format_exc()
+    logger.error(f"[500_ERROR] {request.method} {request.url.path}: {exc}\n{error_tb}")
     return JSONResponse(
         status_code=500,
-        content={"detail": "Internal Server Error", "error": str(exc), "path": request.url.path}
+        content={"error": str(exc), "type": type(exc).__name__, "path": str(request.url.path), "traceback": error_tb}
     )
 
 # --- Fully Responsive GenAI Chatbot with Dark & Light Theme Switcher ---
