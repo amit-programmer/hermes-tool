@@ -100,6 +100,11 @@ load_dotenv()
 # Import Short-Term Memory and Document Working Memory Store
 from session_memory import SessionMemoryStore, session_memory_store, PinnedDocument, SessionState
 
+# Security, Caching, and Big File Chunking Modules
+from security_check import check_file, MAX_SIZE as MAX_FILE_SIZE
+from cache_manager import get_from_cache, save_to_cache
+from big_file_handler import process_big_file, extract_chunks
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -1677,19 +1682,52 @@ async def extract_file_endpoint(
     session_id: Optional[str] = Form(None)
 ):
     """
-    Extracts text, data tables, or OCR content from uploaded files without Vector DB.
-    Supports PDF, Word, Excel, PPTX, CSV, TXT, Code, Images, etc.
-    Optionally pins extracted content into the session's short-term working memory.
+    Extracts text, data tables, or visual metadata from uploaded files without Vector DB.
+    Guarded by security checks (MIME & size) and persistent disk caching.
     """
+    temp_path = None
     try:
         content_bytes = await file.read()
-        res = extract_content_from_file(file.filename or "unknown_file", content_bytes)
+        filename = file.filename or "unknown_file"
+
+        # 1. Save to temporary file for security & chunk inspection
+        import tempfile
+        ext = os.path.splitext(filename)[1]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tf:
+            tf.write(content_bytes)
+            temp_path = tf.name
+
+        # 2. STEP 1: Security Check (Size, Magic MIME, Double Extension)
+        is_safe, sec_msg = check_file(temp_path, filename)
+        if not is_safe:
+            logger.warning(f"Security check rejected file '{filename}': {sec_msg}")
+            return JSONResponse(status_code=400, content={"success": False, "error": sec_msg, "extracted_text": ""})
+
+        # 3. STEP 2: Cache Check
+        cached_res = get_from_cache(filename, "extract")
+        if cached_res and isinstance(cached_res, dict):
+            if session_id and cached_res.get("success", True):
+                sess = session_memory_store.get_or_create(session_id)
+                pinned_doc = sess.pin_document(
+                    filename=cached_res.get("filename", filename),
+                    extracted_text=cached_res.get("extracted_text", ""),
+                    summary=cached_res.get("summary", ""),
+                    size_kb=cached_res.get("size_kb", 0.0)
+                )
+                cached_res["session_id"] = session_id
+                cached_res["pinned_to_session"] = True
+                cached_res["doc_id"] = pinned_doc.doc_id
+            cached_res["from_cache"] = True
+            return JSONResponse(status_code=200, content=cached_res)
+
+        # 4. STEP 3: Multi-Format Extraction
+        res = extract_content_from_file(filename, content_bytes)
 
         # Pin extracted document to session working memory if session_id provided
         if session_id and res.get("success", True):
             sess = session_memory_store.get_or_create(session_id)
             pinned_doc = sess.pin_document(
-                filename=res.get("filename", file.filename or "uploaded_file"),
+                filename=res.get("filename", filename),
                 extracted_text=res.get("extracted_text", ""),
                 summary=res.get("summary", ""),
                 size_kb=res.get("size_kb", 0.0)
@@ -1698,10 +1736,20 @@ async def extract_file_endpoint(
             res["pinned_to_session"] = True
             res["doc_id"] = pinned_doc.doc_id
 
+        # 5. STEP 4: Cache the extraction
+        if res.get("success", True):
+            save_to_cache(filename, "extract", res)
+
         return JSONResponse(status_code=200, content=res)
     except Exception as e:
         logger.error(f"Error in /v1/files/extract: {e}")
         return JSONResponse(status_code=500, content={"success": False, "error": str(e), "extracted_text": ""})
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
 @app.post("/v1/chat/upload-and-complete")
 async def chat_upload_and_complete(
@@ -1713,7 +1761,7 @@ async def chat_upload_and_complete(
 ):
     """
     Convenience multipart endpoint to upload a file + question together in one request.
-    Extracts file content, pins to short-term working memory, constructs prompt, and returns completion.
+    Protected by security check, cache lookup, and big-file chunking.
     """
     if model is None:
         try:
@@ -1722,55 +1770,100 @@ async def chat_upload_and_complete(
             raise HTTPException(status_code=500, detail=f"Model is not loaded: {str(e)}")
 
     content_bytes = await file.read()
-    extracted = extract_content_from_file(file.filename or "file", content_bytes)
-
-    file_context = extracted.get("extracted_text", "")
+    filename = file.filename or "file"
     user_prompt = (prompt or "Please analyze and summarize this attached file.").strip()
 
-    # Session Short-Term Working Memory persistence
-    target_session_id = (session_id or "").strip() or f"sess_{uuid.uuid4().hex[:12]}"
-    sess = session_memory_store.get_or_create(target_session_id)
-    if extracted.get("success", True):
-        sess.pin_document(
-            filename=extracted["filename"],
-            extracted_text=file_context,
-            summary=extracted.get("summary", ""),
-            size_kb=extracted.get("size_kb", 0.0)
-        )
-    sess.add_message("user", user_prompt)
+    # 1. Security Check
+    import tempfile
+    ext = os.path.splitext(filename)[1]
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tf:
+            tf.write(content_bytes)
+            temp_path = tf.name
 
-    combined_user_content = (
-        f"[ATTACHED FILE: {extracted['filename']} ({extracted['summary']})]\n"
-        f"--- BEGIN FILE CONTENT ---\n{file_context}\n--- END FILE CONTENT ---\n\n"
-        f"User Query:\n{user_prompt}"
-    )
+        is_safe, sec_msg = check_file(temp_path, filename)
+        if not is_safe:
+            raise HTTPException(status_code=400, detail=f"Security check failed: {sec_msg}")
 
-    messages = [
-        Message(role="system", content=DEFAULT_SYSTEM_PROMPT),
-        Message(role="user", content=combined_user_content)
-    ]
-    prompt_text = construct_chatml_prompt(messages)
+        # 2. Cache Check (if exact question on this file was answered before)
+        cached_answer = get_from_cache(filename, user_prompt)
+        if cached_answer and isinstance(cached_answer, str):
+            target_session_id = (session_id or "").strip() or f"sess_{uuid.uuid4().hex[:12]}"
+            sess = session_memory_store.get_or_create(target_session_id)
+            sess.add_message("user", user_prompt)
+            sess.add_message("assistant", cached_answer)
+            return {
+                "status": "success",
+                "session_id": target_session_id,
+                "file": {"filename": filename, "size_kb": round(len(content_bytes) / 1024, 2)},
+                "query": user_prompt,
+                "completion": cached_answer,
+                "from_cache": True
+            }
 
-    generated = generate_local(
-        prompt_text=prompt_text,
-        max_tokens=max_tokens or 300,
-        temperature=temperature or 0.7,
-        top_p=0.95
-    )
+        # 3. Extraction & Big File Handling
+        extracted = extract_content_from_file(filename, content_bytes)
+        file_context = extracted.get("extracted_text", "")
 
-    sess.add_message("assistant", generated)
+        # Session Short-Term Working Memory persistence
+        target_session_id = (session_id or "").strip() or f"sess_{uuid.uuid4().hex[:12]}"
+        sess = session_memory_store.get_or_create(target_session_id)
+        if extracted.get("success", True):
+            sess.pin_document(
+                filename=extracted["filename"],
+                extracted_text=file_context,
+                summary=extracted.get("summary", ""),
+                size_kb=extracted.get("size_kb", 0.0)
+            )
+        sess.add_message("user", user_prompt)
 
-    return {
-        "status": "success",
-        "session_id": target_session_id,
-        "file": {
-            "filename": extracted["filename"],
-            "size_kb": extracted["size_kb"],
-            "summary": extracted["summary"]
-        },
-        "query": user_prompt,
-        "completion": generated
-    }
+        # Check if file has many chunks (> 5 chunks)
+        clean_ext = ext.lstrip(".").lower()
+        chunks = extract_chunks(temp_path, clean_ext)
+        if len(chunks) > 5:
+            # Use big file handler to select only relevant chunks for crisp context
+            def _local_caller(p):
+                return generate_local(p, max_tokens=max_tokens or 300, temperature=temperature or 0.7)
+            generated = process_big_file(temp_path, clean_ext, user_prompt, model_func=_local_caller)
+        else:
+            combined_user_content = (
+                f"[ATTACHED FILE: {extracted['filename']} ({extracted['summary']})]\n"
+                f"--- BEGIN FILE CONTENT ---\n{file_context}\n--- END FILE CONTENT ---\n\n"
+                f"User Query:\n{user_prompt}"
+            )
+            messages = [
+                Message(role="system", content=DEFAULT_SYSTEM_PROMPT),
+                Message(role="user", content=combined_user_content)
+            ]
+            prompt_text = construct_chatml_prompt(messages)
+            generated = generate_local(
+                prompt_text=prompt_text,
+                max_tokens=max_tokens or 300,
+                temperature=temperature or 0.7,
+                top_p=0.95
+            )
+
+        sess.add_message("assistant", generated)
+        save_to_cache(filename, user_prompt, generated)
+
+        return {
+            "status": "success",
+            "session_id": target_session_id,
+            "file": {
+                "filename": extracted["filename"],
+                "size_kb": extracted["size_kb"],
+                "summary": extracted["summary"]
+            },
+            "query": user_prompt,
+            "completion": generated
+        }
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
 # --- Short-Term Working Memory Management Endpoints ---
 
