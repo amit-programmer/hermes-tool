@@ -1,5 +1,16 @@
 import os
 import sys
+
+# HF_HOME Cache directory setup (preserves downloaded model in /data across ZeroGPU restarts)
+if sys.platform != "win32":
+    os.environ["HF_HOME"] = "/data/hf_cache"
+    try:
+        os.makedirs("/data/hf_cache", exist_ok=True)
+    except Exception:
+        pass
+else:
+    os.environ.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+
 import time
 import json
 import uuid
@@ -44,7 +55,8 @@ import torch
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
-    TextIteratorStreamer
+    TextIteratorStreamer,
+    BitsAndBytesConfig
 )
 import io
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
@@ -80,11 +92,6 @@ try:
     from PIL import Image
 except ImportError:
     Image = None
-
-try:
-    import pytesseract
-except ImportError:
-    pytesseract = None
 
 
 # Load environment variables from .env
@@ -190,10 +197,11 @@ def get_eos_token_ids(tok, custom_stops: Optional[List[str]] = None) -> List[int
 
     return list(stop_ids)
 
+@spaces.GPU(duration=120)
 def load_local_model():
     """
     Downloads and loads the model and tokenizer into memory with thread-safety.
-    Uses native bfloat16 on CUDA / ZeroGPU with SDPA and KV cache enabled.
+    Uses 4-bit quantization (BitsAndBytes NF4, ~5GB VRAM) on CUDA/ZeroGPU for optimal efficiency.
     """
     global tokenizer, model, is_model_loading, model_load_error
     if model is not None and tokenizer is not None:
@@ -218,32 +226,46 @@ def load_local_model():
             device_str = "cuda" if torch.cuda.is_available() else "cpu"
             logger.info(f"2. Target device detected: {device_str.upper()} (ZeroGPU: {HAS_SPACES}, Dtype: {dtype})")
 
+            # 4-bit Quantization Config (drastically drops memory from 16GB to ~5GB VRAM)
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+
             load_kwargs = {
                 "pretrained_model_name_or_path": MODEL_ID,
                 "token": HF_TOKEN,
-                "torch_dtype": dtype,
+                "quantization_config": bnb_config,
                 "device_map": "auto",
                 "low_cpu_mem_usage": True,
                 "trust_remote_code": True,
             }
 
             try:
-                # Transformers >= 4.36 supports native SDPA (Scaled Dot-Product Attention) for Flash Attention & KV cache
-                logger.info("   Mounting model with attn_implementation='sdpa' for optimal KV cache throughput...")
+                logger.info("3. Loading 4-bit quantized model (BitsAndBytes NF4, ~5GB VRAM) with SDPA...")
                 model = AutoModelForCausalLM.from_pretrained(
                     **load_kwargs,
                     attn_implementation="sdpa"
                 )
-            except Exception as attn_err:
-                logger.info(f"   Note on SDPA mount ({attn_err}); loading with default attention...")
-                model = AutoModelForCausalLM.from_pretrained(**load_kwargs)
+            except Exception as quant_sdpa_err:
+                try:
+                    logger.info(f"   Note on 4-bit SDPA mount ({quant_sdpa_err}); attempting default attention...")
+                    model = AutoModelForCausalLM.from_pretrained(**load_kwargs)
+                except Exception as quant_err:
+                    logger.warning(f"   4-bit load fallback ({quant_err}); loading standard precision...")
+                    load_kwargs.pop("quantization_config", None)
+                    load_kwargs["torch_dtype"] = dtype
+                    load_kwargs["device_map"] = "auto" if torch.cuda.is_available() else None
+                    model = AutoModelForCausalLM.from_pretrained(**load_kwargs)
 
             model.eval()
             # Ensure KV cache is enabled
             if hasattr(model, "generation_config") and model.generation_config is not None:
                 model.generation_config.use_cache = True
 
-            logger.info(f"3. Model '{MODEL_ID}' successfully loaded into memory! KV Cache enabled.")
+            logger.info(f"4. Model '{MODEL_ID}' successfully loaded into memory! KV Cache enabled.")
             is_model_loading = False
             model_load_error = None
             return model, tokenizer
@@ -279,7 +301,7 @@ class Message(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: Optional[str] = MODEL_ID
     messages: List[Message]
-    max_tokens: Optional[int] = Field(default=2048, ge=1, le=8192)
+    max_tokens: Optional[int] = Field(default=300, ge=1, le=8192)
     temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0)
     top_p: Optional[float] = Field(default=0.95, ge=0.0, le=1.0)
     stream: Optional[bool] = False
@@ -375,7 +397,7 @@ def enforce_context_budget(prompt_text: str, max_tokens: int, tok) -> str:
 # --- Core Generation Function ---
 def _generate_core(
     prompt_text: str,
-    max_tokens: int = 2048,
+    max_tokens: int = 300,
     temperature: float = 0.7,
     top_p: float = 0.95,
     stop: Optional[List[str]] = None
@@ -416,7 +438,7 @@ def _generate_core(
 @spaces.GPU(duration=120)
 def generate_local(
     prompt_text: str,
-    max_tokens: int = 2048,
+    max_tokens: int = 300,
     temperature: float = 0.7,
     top_p: float = 0.95,
     stop: Optional[List[str]] = None
@@ -427,7 +449,7 @@ def generate_local(
 @spaces.GPU(duration=120)
 def stream_local_tokens(
     prompt_text: str,
-    max_tokens: int = 2048,
+    max_tokens: int = 300,
     temperature: float = 0.7,
     top_p: float = 0.95,
     stop: Optional[List[str]] = None
@@ -692,7 +714,7 @@ async def chat_completions(req: ChatCompletionRequest):
                 accumulated_text = []
                 for token_text in stream_local_tokens(
                     prompt_text=prompt_text,
-                    max_tokens=req.max_tokens or 2048,
+                    max_tokens=req.max_tokens or 300,
                     temperature=req.temperature,
                     top_p=req.top_p,
                     stop=custom_stops
@@ -761,7 +783,7 @@ async def chat_completions(req: ChatCompletionRequest):
     try:
         generated_content = generate_local(
             prompt_text=prompt_text,
-            max_tokens=req.max_tokens or 2048,
+            max_tokens=req.max_tokens or 300,
             temperature=req.temperature,
             top_p=req.top_p,
             stop=custom_stops
@@ -1528,37 +1550,8 @@ def extract_image(filename: str, file_bytes: bytes, size_kb: float) -> dict:
         if exif_details:
             meta_lines.append("- **EXIF Metadata:**\n" + "\n".join(exif_details))
 
-        ocr_text = ""
-        ocr_status = "not_available"
-        if pytesseract is not None:
-            try:
-                ocr_img = img
-                if max(width, height) > 2200:
-                    scale = 2200.0 / max(width, height)
-                    new_w = int(width * scale)
-                    new_h = int(height * scale)
-                    resample_filter = getattr(Image, "Resampling", Image).LANCZOS
-                    ocr_img = img.resize((new_w, new_h), resample=resample_filter)
-
-                if ocr_img.mode in ("RGBA", "P", "LA", "CMYK"):
-                    ocr_img = ocr_img.convert("RGB")
-
-                ocr_text = pytesseract.image_to_string(ocr_img).strip()
-                ocr_status = "success" if ocr_text else "no_text_found"
-            except pytesseract.TesseractNotFoundError:
-                ocr_status = "tesseract_binary_not_found"
-            except Exception as oe:
-                ocr_status = f"ocr_error: {str(oe)}"
-
-        if ocr_text:
-            meta_lines.append(f"\n#### Extracted OCR Text:\n```text\n{ocr_text}\n```")
-            summary = f"Image ({width}×{height}px, {img_format}) with OCR text ({len(ocr_text.split()):,} words)"
-        elif ocr_status == "tesseract_binary_not_found":
-            meta_lines.append("\n*(Tesseract OCR engine is not configured in the host environment; visual dimensions and format metadata extracted.)*")
-            summary = f"Image ({width}×{height}px, {img_format}) [OCR engine unconfigured]"
-        else:
-            meta_lines.append("\n*(No textual content detected in image via OCR; visual dimensions and format metadata extracted.)*")
-            summary = f"Image ({width}×{height}px, {img_format})"
+        summary = f"Image ({width}×{height}px, {img_format})"
+        meta_lines.append(f"\n*(Image attachment: {width}×{height}px, format: {img_format}, mode: {img_mode}. Metadata parsed cleanly without external OCR engine.)*")
 
         full_doc = "\n".join(meta_lines)
         return {
@@ -1569,8 +1562,8 @@ def extract_image(filename: str, file_bytes: bytes, size_kb: float) -> dict:
                 "height": height,
                 "format": img_format,
                 "color_mode": img_mode,
-                "ocr_status": ocr_status,
-                "word_count": len(ocr_text.split()) if ocr_text else 0
+                "ocr_status": "disabled",
+                "word_count": 0
             },
             "error": None
         }
@@ -1714,7 +1707,7 @@ async def extract_file_endpoint(
 async def chat_upload_and_complete(
     file: UploadFile = File(...),
     prompt: Optional[str] = Form(None),
-    max_tokens: Optional[int] = Form(1024),
+    max_tokens: Optional[int] = Form(300),
     temperature: Optional[float] = Form(0.7),
     session_id: Optional[str] = Form(None)
 ):
@@ -1760,7 +1753,7 @@ async def chat_upload_and_complete(
 
     generated = generate_local(
         prompt_text=prompt_text,
-        max_tokens=max_tokens or 1024,
+        max_tokens=max_tokens or 300,
         temperature=temperature or 0.7,
         top_p=0.95
     )
@@ -3457,7 +3450,7 @@ HTML_PLAYGROUND = """<!DOCTYPE html>
           session_id: currentSessionId,
           messages: apiMessages,
           temperature: 0.7,
-          max_tokens: 1536,
+          max_tokens: 300,
           stream: true
         };
 
@@ -3668,7 +3661,7 @@ try:
 
         prompt = construct_chatml_prompt(conversation)
         try:
-            return _generate_core(prompt, 1024, 0.7, 0.95)
+            return _generate_core(prompt, 300, 0.7, 0.95)
         except Exception as e:
             return f"❌ Error: {str(e)}"
 
