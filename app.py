@@ -153,17 +153,10 @@ _model_load_lock = Lock()
 MAX_CONTEXT_BUDGET = 131072
 
 def get_optimal_torch_dtype() -> torch.dtype:
-    """Selects bfloat16 for ZeroGPU / Ampere / Hopper / Ada, float16 for older CUDA, float32 for CPU."""
+    """Selects bfloat16 for ZeroGPU / Ampere / Hopper / Ada, float16 for CUDA, float32 for CPU without top-level CUDA init."""
     if HAS_SPACES:
         return torch.bfloat16
-    if torch.cuda.is_available():
-        try:
-            if torch.cuda.is_bf16_supported():
-                return torch.bfloat16
-        except Exception:
-            pass
-        return torch.float16
-    return torch.float32
+    return torch.float16 if sys.platform != "win32" else torch.float32
 
 def get_eos_token_ids(tok, custom_stops: Optional[List[str]] = None) -> List[int]:
     """Retrieves all stop token IDs for Hermes-3 / Llama 3.1 plus optional custom stop tokens."""
@@ -202,10 +195,10 @@ def get_eos_token_ids(tok, custom_stops: Optional[List[str]] = None) -> List[int
 
     return list(stop_ids)
 
-@spaces.GPU(duration=120)
+@spaces.GPU(duration=180)
 def load_local_model():
     """
-    Downloads and loads the model and tokenizer into memory with thread-safety.
+    Downloads and loads the model and tokenizer into memory with thread-safety inside @spaces.GPU.
     Uses 4-bit quantization (BitsAndBytes NF4, ~5GB VRAM) on CUDA/ZeroGPU for optimal efficiency.
     """
     global tokenizer, model, is_model_loading, model_load_error
@@ -228,7 +221,7 @@ def load_local_model():
                 tokenizer.pad_token = tokenizer.eos_token
 
             dtype = get_optimal_torch_dtype()
-            device_str = "cuda" if torch.cuda.is_available() else "cpu"
+            device_str = "cuda" if (HAS_SPACES or torch.cuda.is_available()) else "cpu"
             logger.info(f"2. Target device detected: {device_str.upper()} (ZeroGPU: {HAS_SPACES}, Dtype: {dtype})")
 
             # 4-bit Quantization Config (drastically drops memory from 16GB to ~5GB VRAM)
@@ -440,7 +433,7 @@ def _generate_core(
     return sanitize_assistant_output(raw_output, custom_stops=stop)
 
 # --- Generation with ZeroGPU Decorators ---
-@spaces.GPU(duration=120)
+@spaces.GPU(duration=180)
 def generate_local(
     prompt_text: str,
     max_tokens: int = 300,
@@ -451,7 +444,7 @@ def generate_local(
     """Entrypoint for FastAPI inference requests on ZeroGPU."""
     return _generate_core(prompt_text, max_tokens, temperature, top_p, stop=stop)
 
-@spaces.GPU(duration=120)
+@spaces.GPU(duration=180)
 def stream_local_tokens(
     prompt_text: str,
     max_tokens: int = 300,
@@ -522,53 +515,29 @@ def stream_local_tokens(
 
 @app.on_event("startup")
 async def startup_event():
-    """Fast server startup with background model preloader and JIT warmup."""
-    logger.info("Hermes-3 8B Local API Server initialized.")
-    if os.getenv("SKIP_STARTUP_PRELOAD", "0").lower() in ("1", "true", "yes"):
-        logger.info("SKIP_STARTUP_PRELOAD active; skipping startup background preload.")
-        return
-
-    def _preload_and_warm():
-        try:
-            logger.info("Background preloading model into memory...")
-            load_local_model()
-            logger.info("Background model loading complete! Pre-warming JIT kernels & streaming pipeline for minimum TTFT...")
-            try:
-                dummy_prompt = "<|im_start|>user\nping<|im_end|>\n<|im_start|>assistant\n"
-                generate_local(dummy_prompt, 2, 0.5, 0.9)
-                for _ in stream_local_tokens(dummy_prompt, 2, 0.5, 0.9):
-                    pass
-                logger.info("JIT kernels and streaming pipelines pre-warmed successfully!")
-            except Exception as w_err:
-                logger.warning(f"Startup warmup note: {w_err}")
-        except Exception as e:
-            logger.warning(f"Background preload note: {e}")
-
-    Thread(target=_preload_and_warm, daemon=True).start()
+    """Fast server startup in Lazy-Loading mode (ZeroGPU compliant: model loads on first message inside @spaces.GPU)."""
+    logger.info("Hermes-3 8B Local API Server initialized in Lazy-Loading mode (ZeroGPU compliant).")
 
 @app.get("/health")
 async def health_check():
-    """Uptime, GPU, KV cache, and Model status check."""
+    """Uptime, GPU, KV cache, and Model status check (ZeroGPU safe: does not trigger early CUDA initialization)."""
     uptime = time.time() - START_TIME
-    device_name = "unknown"
+    device_name = str(model.device) if model is not None else "lazy_unloaded"
     vram_mb = 0.0
     if model is not None:
         try:
-            device_name = str(model.device)
-            if torch.cuda.is_available():
-                vram_mb = round(torch.cuda.memory_allocated() / (1024 * 1024), 2)
+            vram_mb = round(torch.cuda.memory_allocated() / (1024 * 1024), 2)
         except Exception:
             pass
 
     return {
-        "status": "healthy" if model is not None else ("loading" if is_model_loading else "ready_to_load"),
+        "status": "healthy" if model is not None else "ready_to_load",
         "service": "Hermes-3 8B Local Server",
         "model": MODEL_ID,
         "is_model_loaded": model is not None,
         "device": device_name,
         "vram_allocated_mb": vram_mb,
         "context_window_tokens": MAX_CONTEXT_BUDGET,
-        "cuda_available": torch.cuda.is_available(),
         "has_zerogpu": HAS_SPACES,
         "uptime_seconds": round(uptime, 2),
         "model_load_error": model_load_error
@@ -3739,7 +3708,7 @@ async def root_view(request: Request):
 try:
     import gradio as gr
 
-    @spaces.GPU(duration=120)
+    @spaces.GPU(duration=180)
     def gradio_chat_fn(user_message, history):
         if not user_message:
             return ""
