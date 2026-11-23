@@ -437,7 +437,7 @@ def _generate_core(
     return sanitize_assistant_output(raw_output, custom_stops=stop)
 
 # --- Generation with ZeroGPU Decorators ---
-@spaces.GPU(duration=180)
+@spaces.GPU(duration=60)
 def generate_local(
     prompt_text: str,
     max_tokens: int = 300,
@@ -448,7 +448,7 @@ def generate_local(
     """Entrypoint for FastAPI inference requests on ZeroGPU."""
     return _generate_core(prompt_text, max_tokens, temperature, top_p, stop=stop)
 
-@spaces.GPU(duration=180)
+@spaces.GPU(duration=60)
 def stream_local_tokens(
     prompt_text: str,
     max_tokens: int = 300,
@@ -3715,7 +3715,7 @@ async def root_view(request: Request):
 try:
     import gradio as gr
 
-    @spaces.GPU(duration=180)
+    @spaces.GPU(duration=60)
     def gradio_chat_fn(user_message, history):
         if not user_message:
             return ""
