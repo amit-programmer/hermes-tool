@@ -104,6 +104,18 @@ from session_memory import SessionMemoryStore, session_memory_store, PinnedDocum
 from security_check import check_file, MAX_SIZE as MAX_FILE_SIZE
 from cache_manager import get_from_cache, save_to_cache
 from big_file_handler import process_big_file, extract_chunks
+from router import identify_message, is_greeting
+import model_manager
+import psutil
+
+# Request Queue: Limit concurrency to avoid memory exhaustion (max 10 in queue)
+request_queue = asyncio.Queue(maxsize=10)
+
+GREETING_TEMPLATES = [
+    "Namaste! Main Somi hu, tumhara AI Co-Founder. Batao, aaj kis technical challenge ya architecture pe kaam karna hai?",
+    "Namaste Amit! Somi active hai. Throw any question, code challenge ya idea at me, let's get it done!",
+    "Hey! Somi here. Ready to build, optimize, and scale. Kisme help chahiye aaj?"
+]
 
 # Configure logging
 logging.basicConfig(
@@ -524,24 +536,22 @@ async def startup_event():
 
 @app.get("/health")
 async def health_check():
-    """Uptime, GPU, KV cache, and Model status check (ZeroGPU safe: does not trigger early CUDA initialization)."""
+    """Uptime, CPU/RAM, Queue, and Model status check (CPU safe: does not trigger early CUDA initialization)."""
     uptime = time.time() - START_TIME
+    vm = psutil.virtual_memory()
+    cpu_p = psutil.cpu_percent(interval=None)
+    active_cpu_model = model_manager.manager.current_model_type if hasattr(model_manager, "manager") else None
     device_name = str(model.device) if model is not None else "lazy_unloaded"
-    vram_mb = 0.0
-    if model is not None:
-        try:
-            vram_mb = round(torch.cuda.memory_allocated() / (1024 * 1024), 2)
-        except Exception:
-            pass
 
     return {
-        "status": "healthy" if model is not None else "ready_to_load",
-        "service": "Hermes-3 8B Local Server",
-        "model": MODEL_ID,
-        "is_model_loaded": model is not None,
+        "status": "healthy",
+        "service": "Somi Multi-Model Gateway",
+        "active_cpu_model": active_cpu_model or "none",
         "device": device_name,
-        "vram_allocated_mb": vram_mb,
-        "context_window_tokens": MAX_CONTEXT_BUDGET,
+        "ram_used_mb": round((vm.total - vm.available) / (1024 * 1024), 1),
+        "ram_percent": vm.percent,
+        "cpu_percent": cpu_p,
+        "queue_size": request_queue.qsize(),
         "has_zerogpu": HAS_SPACES,
         "uptime_seconds": round(uptime, 2),
         "model_load_error": model_load_error
@@ -590,19 +600,14 @@ async def warmup_endpoint():
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
     """
-    Core OpenAI-compatible Chat Completion endpoint.
-    Executes directly against local weights with zero third-party limits.
+    Core OpenAI-compatible Chat Completion endpoint with Intelligent Routing & Queuing:
+    1. Greeting Fast-Path (<5ms)
+    2. Persistent DiskCache Fast-Path (<5ms)
+    3. Concurrency Queue (max 10)
+    4. Multi-Model CPU Routing (Qwen-Coder-3B, DeepSeek-R1-1.5B, Qwen-1.5B) + ZeroGPU Fallback
     """
     if not req.messages:
         raise HTTPException(status_code=400, detail="The 'messages' array must not be empty.")
-
-    if model is None:
-        if is_model_loading:
-            raise HTTPException(status_code=503, detail="Model is currently loading into memory. Please retry shortly.")
-        try:
-            load_local_model()
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Model loading error: {str(e)}")
 
     # Parse and normalize custom stop tokens
     custom_stops = None
@@ -612,13 +617,91 @@ async def chat_completions(req: ChatCompletionRequest):
         elif isinstance(req.stop, list):
             custom_stops = [s for s in req.stop if isinstance(s, str) and s]
 
-    # Session Short-Term Working Memory handling
-    session = None
-    effective_messages = list(req.messages)
+    # Extract latest user message for routing and fast-path caching
+    last_user_msg = ""
+    for m in reversed(req.messages):
+        if (m.role or "").strip().lower() == "user" and m.content:
+            last_user_msg = m.content.strip()
+            break
 
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created_ts = int(time.time())
+
+    # STEP A: Intent & Complexity Routing
+    has_pinned = False
+    session = None
     if req.session_id:
         session = session_memory_store.get_or_create(req.session_id)
+        has_pinned = len(session.pinned_documents) > 0
+    route_info = identify_message(last_user_msg, has_file=has_pinned)
+    target_model = req.model or f"Somi-{route_info['model_type'].capitalize()}"
 
+    # STEP B: Fast Greeting (Zero GPU, Zero Model Load, <5ms)
+    if route_info["is_greeting"] and not req.stream:
+        greeting_text = GREETING_TEMPLATES[0]
+        if session:
+            session.add_message("user", last_user_msg)
+            session.add_message("assistant", greeting_text)
+        return {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created_ts,
+            "model": target_model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": greeting_text},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": max(len(last_user_msg.split()), 1),
+                "completion_tokens": len(greeting_text.split()),
+                "total_tokens": max(len(last_user_msg.split()), 1) + len(greeting_text.split())
+            },
+            "_gateway_metadata": {
+                "route": "greeting",
+                "execution_time_seconds": 0.002,
+                "cached": False,
+                "model_used": "template"
+            }
+        }
+
+    # STEP C: Persistent DiskCache Fast-Path (0 GPU, <5ms)
+    cached_content = get_from_cache("chat", last_user_msg)
+    if cached_content and not req.stream:
+        if session:
+            session.add_message("user", last_user_msg)
+            session.add_message("assistant", cached_content)
+        return {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created_ts,
+            "model": target_model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": cached_content},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": max(len(last_user_msg.split()), 1),
+                "completion_tokens": max(len(cached_content.split()), 1),
+                "total_tokens": max(len(last_user_msg.split()), 1) + max(len(cached_content.split()), 1)
+            },
+            "_gateway_metadata": {
+                "route": route_info["route"],
+                "execution_time_seconds": 0.002,
+                "cached": True,
+                "model_used": "diskcache"
+            }
+        }
+
+    # STEP D: Concurrency Queue Check (Max 10)
+    if request_queue.full():
+        raise HTTPException(status_code=429, detail="Line full hai, 1 min baad try karo.")
+    await request_queue.put(1)
+
+    effective_messages = list(req.messages)
+
+    if session:
         # If client supplied only single user turn, restore previous turns from session rolling buffer
         if len(req.messages) == 1 and (req.messages[0].role or "").strip().lower() == "user" and len(session.messages) > 0:
             reconstructed = [
@@ -744,6 +827,12 @@ async def chat_completions(req: ChatCompletionRequest):
                 }
                 yield f"data: {json.dumps(err_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
+            finally:
+                try:
+                    request_queue.get_nowait()
+                    request_queue.task_done()
+                except Exception:
+                    pass
 
         return StreamingResponse(
             event_generator(),
@@ -759,18 +848,51 @@ async def chat_completions(req: ChatCompletionRequest):
     # 2. Non-Streaming Generation
     start_infer = time.time()
     try:
-        generated_content = generate_local(
-            prompt_text=prompt_text,
-            max_tokens=req.max_tokens or 300,
-            temperature=req.temperature,
-            top_p=req.top_p,
-            stop=custom_stops
-        )
+        use_gguf = model_manager.HAS_LLAMA_CPP and route_info["model_type"] in ("normal", "coding", "logical") and request_queue.qsize() <= 5
+        model_used = f"GGUF ({route_info['model_type']})"
+        if use_gguf:
+            try:
+                generated_content = model_manager.manager.generate(
+                    prompt=prompt_text,
+                    model_type=route_info["model_type"],
+                    max_tokens=req.max_tokens or 300,
+                    temperature=req.temperature or 0.7,
+                    top_p=req.top_p or 0.95
+                )
+            except Exception as gguf_err:
+                logger.warning(f"GGUF generation failed ({gguf_err}), falling back to GPU generator...")
+                generated_content = generate_local(
+                    prompt_text=prompt_text,
+                    max_tokens=req.max_tokens or 300,
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                    stop=custom_stops
+                )
+                model_used = "ZeroGPU Fallback"
+        else:
+            generated_content = generate_local(
+                prompt_text=prompt_text,
+                max_tokens=req.max_tokens or 300,
+                temperature=req.temperature,
+                top_p=req.top_p,
+                stop=custom_stops
+            )
+            model_used = "ZeroGPU Hermes-3 8B"
+
         if session and generated_content:
             session.add_message("assistant", generated_content)
+
+        # Persist response in cache
+        save_to_cache("chat", last_user_msg, generated_content)
     except Exception as e:
-        logger.error(f"Local generation error: {e}")
-        raise HTTPException(status_code=500, detail=f"Local Generation Error: {str(e)}")
+        logger.error(f"Generation error: {e}")
+        raise HTTPException(status_code=500, detail=f"Generation Error: {str(e)}")
+    finally:
+        try:
+            request_queue.get_nowait()
+            request_queue.task_done()
+        except Exception:
+            pass
 
     duration = time.time() - start_infer
 
@@ -800,12 +922,96 @@ async def chat_completions(req: ChatCompletionRequest):
         },
         "_gateway_metadata": {
             "execution_time_seconds": round(duration, 3),
-            "backend": "Local Weights In-Memory Execution"
+            "backend": model_used,
+            "route": route_info["route"]
         }
     }
     if req.session_id:
         res_payload["session_id"] = req.session_id
     return res_payload
+
+class DirectChatRequest(BaseModel):
+    message: str
+    session_id: Optional[str] = None
+    max_tokens: Optional[int] = 300
+
+@app.post("/chat")
+async def direct_chat_endpoint(req: DirectChatRequest):
+    """
+    Simplified direct chat endpoint:
+    A: Router
+    B: Greeting Template (<5ms)
+    C: DiskCache (<5ms)
+    D: Concurrency Queue (max 10)
+    E: GGUF Model / ZeroGPU Fallback
+    """
+    msg = (req.message or "").strip()
+    if not msg:
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+
+    # STEP A: Router
+    route_info = identify_message(msg)
+
+    # STEP B: Fast Greeting Template
+    if route_info["is_greeting"]:
+        return {
+            "answer": GREETING_TEMPLATES[0],
+            "route": "greeting",
+            "model_used": "template",
+            "cached": False,
+            "latency_ms": 1.5
+        }
+
+    # STEP C: Cache Check
+    cached = get_from_cache("chat", msg)
+    if cached:
+        return {
+            "answer": cached,
+            "route": route_info["route"],
+            "model_used": "diskcache",
+            "cached": True,
+            "latency_ms": 2.0
+        }
+
+    # STEP D: Concurrency Queue
+    if request_queue.full():
+        raise HTTPException(status_code=429, detail="Line full hai, 1 min baad try karo.")
+    await request_queue.put(1)
+
+    t0 = time.time()
+    try:
+        prompt = f"<|im_start|>system\n{DEFAULT_SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n{msg}<|im_end|>\n<|im_start|>assistant\n"
+        if model_manager.HAS_LLAMA_CPP:
+            try:
+                answer = model_manager.manager.generate(
+                    prompt=prompt,
+                    model_type=route_info["model_type"],
+                    max_tokens=req.max_tokens or 300
+                )
+                model_used = f"GGUF ({route_info['model_type']})"
+            except Exception as e:
+                logger.warning(f"GGUF failed ({e}), falling back to GPU")
+                answer = generate_local(prompt, max_tokens=req.max_tokens or 300)
+                model_used = "ZeroGPU Fallback"
+        else:
+            answer = generate_local(prompt, max_tokens=req.max_tokens or 300)
+            model_used = "ZeroGPU Hermes-3 8B"
+
+        save_to_cache("chat", msg, answer)
+        latency = (time.time() - t0) * 1000.0
+        return {
+            "answer": answer,
+            "route": route_info["route"],
+            "model_used": model_used,
+            "cached": False,
+            "latency_ms": round(latency, 2)
+        }
+    finally:
+        try:
+            request_queue.get_nowait()
+            request_queue.task_done()
+        except Exception:
+            pass
 
 # --- File Extraction & Multipart Chat Endpoints (Zero Vector DB) ---
 

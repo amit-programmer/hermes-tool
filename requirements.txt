@@ -1,12 +1,7 @@
-huggingface_hub<0.26.0
 spaces
 fastapi>=0.110.0
 uvicorn>=0.28.0
 pydantic>=2.6.0
-transformers>=4.44.0
-torch
-accelerate
-bitsandbytes
 python-dotenv>=1.0.0
 python-multipart>=0.0.9
 pypdf>=4.0.0
@@ -15,7 +10,10 @@ openpyxl>=3.1.2
 pandas>=2.2.0
 python-pptx>=0.6.23
 Pillow>=10.0.0
-raganything
+llama-cpp-python
 python-magic
 diskcache
 psutil
+sumy
+sentence-transformers
+huggingface_hub

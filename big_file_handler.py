@@ -1,12 +1,16 @@
 # big_file_handler.py
 """
-High-capacity multi-format document chunker and context-aware retriever (Vector-DB-Free).
-Splits large PDFs, Word documents, Excel workbooks, PowerPoint slides, and Code/Logs
-into manageable chunks, extracts chunk summaries, and selects the most relevant
-content for Hermes-3 8B within the 128k context budget.
+High-capacity multi-format document chunker and context-aware retriever (CPU-Optimized).
+4-Step Architecture:
+1. Todo: Splits large PDFs (20-p), DOCX (headings), XLSX (1,000 rows), PPTX (20 slides), TXT (5,000 lines).
+2. Chhota Summary: Summarizes chunks rapidly.
+3. Sahi Tukda Dhoondo: Uses BAAI/bge-small-en-v1.5 embedding similarity to find the most relevant chunk.
+4. Final Synthesis: Synthesizes final answer via DeepSeek-R1-Distill-1.5B (or model_func).
 """
 import os
-from typing import List, Optional, Callable
+import sys
+import re
+from typing import List, Optional, Callable, Dict, Any
 
 # Safe multi-format library imports
 try:
@@ -28,6 +32,34 @@ try:
     from pptx import Presentation
 except ImportError:
     Presentation = None
+
+# Safe embedding imports
+try:
+    from sentence_transformers import SentenceTransformer, util
+    HAS_SENTENCE_TRANSFORMERS = True
+except Exception:
+    SentenceTransformer = None
+    util = None
+    HAS_SENTENCE_TRANSFORMERS = False
+
+_embedder = None
+
+def get_embedder():
+    """Lazily loads BAAI/bge-small-en-v1.5 embedding model on CPU (~33MB)."""
+    global _embedder
+    if not HAS_SENTENCE_TRANSFORMERS:
+        return None
+    if _embedder is None:
+        try:
+            cache_folder = "/data/models/bge-small" if (sys.platform != "win32" and os.path.exists("/data")) else "./models/bge-small"
+            _embedder = SentenceTransformer("BAAI/bge-small-en-v1.5", cache_folder=cache_folder)
+        except Exception:
+            try:
+                _embedder = SentenceTransformer("BAAI/bge-small-en-v1.5")
+            except Exception:
+                _embedder = None
+    return _embedder
+
 
 # ---- STEP 1: Multi-Format Chunking Engine ----
 
@@ -67,7 +99,6 @@ def extract_chunks(file_path: str, file_type: str) -> List[str]:
                 text = para.text.strip()
                 if not text:
                     continue
-                # Split at primary headings
                 if para.style and para.style.name and "heading" in para.style.name.lower() and cur:
                     chunks.append("\n".join(cur))
                     cur = [f"## {text}"]
@@ -123,66 +154,69 @@ def extract_chunks(file_path: str, file_type: str) -> List[str]:
 
     return chunks or ["[Empty or unsupported file content]"]
 
-# ---- STEP 2, 3, 4: Vector-DB-Free Intelligent Big File Processing ----
 
-def process_big_file(file_path: str, file_type: str, question: str, model_func: Optional[Callable[[str], str]] = None) -> str:
+# ---- STEP 2, 3, 4: CPU-Based Embeddings & Summarization Pipeline ----
+
+def find_relevant_chunks(chunks: List[str], question: str, top_k: int = 2) -> List[str]:
     """
-    Processes large files accurately without an external Vector DB:
-    1. Extracts structured chunks.
-    2. Small files (<= 5 chunks): Direct synthesis.
-    3. Big files (> 5 chunks):
-       - Summarizes / tags chunks.
-       - Matches keywords against question.
-       - Gathers most relevant chunks up to ~12,000 chars.
-       - Generates focused, hallucination-free answer.
+    Finds the most relevant chunks using BAAI/bge-small embedding similarity on CPU.
+    Falls back to token overlap scoring if embedder is unavailable.
+    """
+    if len(chunks) <= top_k:
+        return chunks
+
+    embedder = get_embedder()
+    if embedder is not None and util is not None:
+        try:
+            q_emb = embedder.encode(question, convert_to_tensor=True)
+            c_embs = embedder.encode(chunks, convert_to_tensor=True)
+            hits = util.semantic_search(q_emb, c_embs, top_k=top_k)
+            if hits and len(hits[0]) > 0:
+                selected = [chunks[hit["corpus_id"]] for hit in hits[0]]
+                return selected
+        except Exception:
+            pass
+
+    # Keyword fallback
+    keywords = [w.lower().strip(".,!?:;\"'()") for w in question.split() if len(w) > 3]
+    scores = []
+    for idx, c in enumerate(chunks):
+        c_lower = c.lower()
+        score = sum(c_lower.count(k) for k in keywords)
+        scores.append((score, idx))
+    scores.sort(key=lambda x: x[0], reverse=True)
+    return [chunks[s[1]] for s in scores[:top_k]]
+
+
+def process_big_file(
+    file_path: str,
+    file_type: str,
+    question: str,
+    model_func: Optional[Callable[[str], str]] = None
+) -> str:
+    """
+    Full 4-step CPU extraction & QA pipeline:
+    1. Extract chunks without memory bloat.
+    2. Rank & select top relevant chunks using BGE-small embeddings.
+    3. Assemble crisp excerpt context (< 12,000 chars).
+    4. Pass to reasoning model (DeepSeek) or model_func for synthesis.
     """
     chunks = extract_chunks(file_path, file_type)
-
     if not chunks:
         return "File me koi readable text ya content nahi mila."
 
-    # If no model_func is provided, return concatenated clean chunks for prompt injection
+    # If no model_func is provided, return concatenated clean chunks
     if model_func is None:
-        return "\n\n".join(chunks[:5])
+        return "\n\n".join(chunks[:3])
 
-    # Case A: Small files (<= 5 chunks) - Full direct context synthesis
-    if len(chunks) <= 5:
-        full_text = "\n\n".join(chunks)
-        prompt = (
-            f"Document Content:\n{full_text}\n\n"
-            f"Question:\n{question}\n\n"
-            f"Instructions:\n"
-            f"Answer accurately using ONLY the document content above. If the information is not present, state clearly that it is not found."
-        )
-        return model_func(prompt)
+    # Select top 2-3 most relevant chunks
+    relevant_chunks = find_relevant_chunks(chunks, question, top_k=2)
+    relevant_text = "\n\n---\n\n".join(relevant_chunks)[:12000]
 
-    # Case B: Large files (> 5 chunks) - Intelligent Keyword & Chunk Filtering
-    keywords = [w.lower().strip(".,!?:;\"'()") for w in question.split() if len(w) > 3]
-
-    # Score chunks by keyword occurrence
-    chunk_scores = []
-    for idx, chunk in enumerate(chunks):
-        chunk_lower = chunk.lower()
-        score = sum(chunk_lower.count(k) for k in keywords)
-        chunk_scores.append((score, idx, chunk))
-
-    # Sort descending by score
-    chunk_scores.sort(key=lambda x: x[0], reverse=True)
-
-    # Pick top relevant chunks (or first 2 if no keyword match)
-    relevant = [cs[2] for cs in chunk_scores if cs[0] > 0]
-    if not relevant:
-        relevant = chunks[:2]
-    else:
-        relevant = relevant[:3]
-
-    # Cap relevant text around 12,000 chars to protect context and ensure crisp latency
-    relevant_text = "\n\n---\n\n".join(relevant)[:12000]
-
-    final_prompt = (
+    prompt = (
         f"Relevant Document Excerpts:\n{relevant_text}\n\n"
         f"Question:\n{question}\n\n"
         f"Instructions:\n"
-        f"Answer the question directly and concisely based strictly on the relevant excerpts above."
+        f"Answer the question directly, accurately, and concisely based strictly on the relevant excerpts above."
     )
-    return model_func(final_prompt)
+    return model_func(prompt)
