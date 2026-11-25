@@ -384,10 +384,15 @@ async def chat_completions(req: ChatCompletionRequest):
     # STEP A: Intent & Complexity Routing
     has_pinned = False
     session = None
+    file_type = None
     if req.session_id:
         session = session_memory_store.get_or_create(req.session_id)
         has_pinned = len(session.pinned_documents) > 0
-    route_info = identify_message(last_user_msg, has_file=has_pinned)
+        if has_pinned:
+            first_doc = next(iter(session.pinned_documents.values()), None)
+            if first_doc:
+                file_type = getattr(first_doc, "extension", "")
+    route_info = identify_message(last_user_msg, has_file=has_pinned, file_type=file_type)
     target_model = req.model or f"Somi-{route_info['model_type'].capitalize()}"
 
     # STEP B: Fast Greeting (Zero GPU, Zero Model Load, <5ms)
@@ -1616,7 +1621,12 @@ async def extract_file_endpoint(
         is_safe, sec_msg = check_file(temp_path, filename)
         if not is_safe:
             logger.warning(f"Security check rejected file '{filename}': {sec_msg}")
-            return JSONResponse(status_code=400, content={"success": False, "error": sec_msg, "extracted_text": ""})
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except Exception:
+                    pass
+            return JSONResponse(status_code=400, content={"success": False, "error": f"Security Block: {sec_msg}", "extracted_text": ""})
 
         # 3. STEP 2: Cache Check
         cached_res = get_from_cache(filename, "extract")
@@ -1699,6 +1709,11 @@ async def chat_upload_and_complete(
 
         is_safe, sec_msg = check_file(temp_path, filename)
         if not is_safe:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except Exception:
+                    pass
             raise HTTPException(status_code=400, detail=f"Security check failed: {sec_msg}")
 
         # 2. Cache Check (if exact question on this file was answered before)
@@ -3656,30 +3671,56 @@ async def root_view(request: Request):
 try:
     import gradio as gr
 
-    @spaces.GPU(duration=60)
-    def gradio_chat_fn(user_message, history):
+    async def gradio_chat_fn(user_message, history):
         if not user_message:
             return ""
 
-        conversation = []
-        if history:
-            for h in history:
-                if isinstance(h, (list, tuple)) and len(h) >= 2:
-                    if h[0]: conversation.append(Message(role="user", content=str(h[0])))
-                    if h[1]: conversation.append(Message(role="assistant", content=str(h[1])))
-        conversation.append(Message(role="user", content=user_message))
+        # 1. Fast-Path: Direct greeting (<1ms)
+        if is_greeting(user_message):
+            return GREETING_TEMPLATES[0]
 
-        prompt = construct_chatml_prompt(conversation)
+        # 2. Fast-Path: Persistent DiskCache (<5ms)
+        cached = get_from_cache("chat", user_message)
+        if cached and isinstance(cached, str):
+            return cached
+
+        # 3. Concurrency Queue (max 10 in queue)
+        if request_queue.full():
+            return "⏳ Server load high hai (Queue full). Kripya 5 second baad dobara try karein."
+
+        await request_queue.put(1)
         try:
+            conversation = []
+            if history:
+                for h in history:
+                    if isinstance(h, (list, tuple)) and len(h) >= 2:
+                        if h[0]: conversation.append(Message(role="user", content=str(h[0])))
+                        if h[1]: conversation.append(Message(role="assistant", content=str(h[1])))
+            conversation.append(Message(role="user", content=user_message))
+
+            prompt = construct_chatml_prompt(conversation)
             route_info = identify_message(user_message)
             if route_info.get("route") == "heavy":
                 try:
-                    return generate_on_gpu_heavy(prompt, 500)
+                    ans = generate_on_gpu_heavy(prompt, 500)
                 except Exception:
-                    return generate_on_cpu(prompt, "coding", 300)
-            return generate_on_cpu(prompt, route_info.get("model_type", "normal"), 300)
+                    ans = generate_on_cpu(prompt, "coding", 300)
+            else:
+                target_type = route_info.get("model_type", "normal")
+                ans = generate_on_cpu(prompt, target_type, 300)
+
+            ans = sanitize_assistant_output(ans)
+            if ans:
+                save_to_cache("chat", user_message, ans)
+            return ans
         except Exception as e:
             return f"❌ Error: {str(e)}"
+        finally:
+            try:
+                request_queue.get_nowait()
+                request_queue.task_done()
+            except Exception:
+                pass
 
     demo = gr.ChatInterface(
         fn=gradio_chat_fn,

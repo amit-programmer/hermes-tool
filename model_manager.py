@@ -44,6 +44,16 @@ MODEL_REGISTRY = {
         "repo_id": "bartowski/DeepSeek-R1-Distill-Qwen-1.5B-GGUF",
         "filename": "DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf",
         "description": "Logical reasoning, analysis, deep step-by-step thinking"
+    },
+    "vision": {
+        "repo_id": "vikhyatk/moondream2",
+        "filename": "moondream2-q4_k_m.gguf",
+        "description": "Visual document and image analysis (Moondream2 GGUF)"
+    },
+    "audio": {
+        "repo_id": "openai/whisper-tiny",
+        "filename": "whisper-tiny.bin",
+        "description": "Audio voice transcription and speech-to-text (Whisper-Tiny)"
     }
 }
 

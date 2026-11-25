@@ -15,86 +15,21 @@ import logging
 import threading
 from typing import List, Dict, Optional, Any
 
+from chat_memory import ChatMemory, ChatMessage, estimate_tokens
+from pinned_docs import PinnedDocs, PinnedDocRef
+
 logger = logging.getLogger("HermesMemoryStore")
 
-
-def estimate_tokens(text: str) -> int:
-    """Fast, safe token estimation (~3.8 characters per token for English & code)."""
-    if not text:
-        return 0
-    return max(1, int(len(text) / 3.8))
-
-
-class SessionMessage:
-    """Represents a single message in a session's rolling buffer."""
-
-    def __init__(self, role: str, content: str, name: Optional[str] = None):
-        self.role: str = (role or "user").strip().lower()
-        self.content: str = content or ""
-        self.name: Optional[str] = name
-        self.timestamp: float = time.time()
-        self.token_count: int = estimate_tokens(self.content)
-
-    def to_dict(self) -> Dict[str, Any]:
-        data = {
-            "role": self.role,
-            "content": self.content,
-            "timestamp": self.timestamp,
-            "token_count": self.token_count,
-        }
-        if self.name:
-            data["name"] = self.name
-        return data
-
-
-class PinnedDocument:
-    """Represents an extracted document pinned into a session's working memory."""
-
-    def __init__(
-        self,
-        doc_id: str,
-        filename: str,
-        extracted_text: str,
-        summary: str = "",
-        size_kb: float = 0.0,
-        extension: str = ""
-    ):
-        self.doc_id: str = doc_id
-        self.filename: str = filename
-        self.extracted_text: str = extracted_text or ""
-        self.summary: str = summary or f"Extracted file ({size_kb:.1f} KB)"
-        self.size_kb: float = size_kb
-        self.extension: str = extension or (filename.split(".")[-1].lower() if "." in filename else "")
-        self.pinned_at: float = time.time()
-        self.token_count: int = estimate_tokens(self.extracted_text)
-
-    def to_dict(self, include_full_text: bool = False) -> Dict[str, Any]:
-        result = {
-            "doc_id": self.doc_id,
-            "filename": self.filename,
-            "extension": self.extension,
-            "size_kb": self.size_kb,
-            "summary": self.summary,
-            "pinned_at": self.pinned_at,
-            "token_count": self.token_count,
-            "text_preview": (
-                self.extracted_text[:300] + "..."
-                if len(self.extracted_text) > 300
-                else self.extracted_text
-            )
-        }
-        if include_full_text:
-            result["extracted_text"] = self.extracted_text
-        return result
+# Type aliases for 100% backward compatibility
+SessionMessage = ChatMessage
+PinnedDocument = PinnedDocRef
 
 
 class SessionState:
     """
-    Thread-safe state container for a single session.
-    Maintains:
-      - Rolling conversation buffer (pruned by turn count and token budget).
-      - Pinned documents (working memory available to all prompts in this session).
-      - Activity timestamps and TTL expiration tracking.
+    Decoupled state container for a single session.
+    Delegates conversation buffer to ChatMemory (RAM, <5KB, rolling 12/30 turns).
+    Delegates heavy document working memory to PinnedDocs (disk-persisted, 0KB RAM).
     """
 
     def __init__(
@@ -107,13 +42,22 @@ class SessionState:
         self.session_id: str = session_id
         self.created_at: float = time.time()
         self.updated_at: float = self.created_at
-        self.max_turns: int = max_turns  # Max total messages in buffer
+        self.max_turns: int = max_turns
         self.max_token_budget: int = max_token_budget
         self.ttl_seconds: float = ttl_seconds
 
-        self.messages: List[SessionMessage] = []
-        self.pinned_documents: Dict[str, PinnedDocument] = {}  # doc_id -> PinnedDocument
+        # Decoupled components:
+        self.chat: ChatMemory = ChatMemory(session_id=session_id, max_messages=max_turns)
+        self.docs: PinnedDocs = PinnedDocs(session_id=session_id)
         self._lock: threading.RLock = threading.RLock()
+
+    @property
+    def messages(self) -> List[ChatMessage]:
+        return self.chat.get_history()
+
+    @property
+    def pinned_documents(self) -> Dict[str, PinnedDocRef]:
+        return self.docs.files
 
     def touch(self) -> None:
         """Update last active timestamp."""
@@ -129,14 +73,11 @@ class SessionState:
         role: str,
         content: str,
         name: Optional[str] = None
-    ) -> SessionMessage:
-        """Add a message to the rolling buffer with automatic pruning."""
+    ) -> ChatMessage:
+        """Add a message to rolling buffer via ChatMemory."""
         with self._lock:
             self.touch()
-            msg = SessionMessage(role=role, content=content, name=name)
-            self.messages.append(msg)
-            self._prune_rolling_buffer()
-            return msg
+            return self.chat.add_message(role=role, content=content, name=name)
 
     def pin_document(
         self,
@@ -145,132 +86,51 @@ class SessionState:
         summary: str = "",
         size_kb: float = 0.0,
         doc_id: Optional[str] = None
-    ) -> PinnedDocument:
-        """
-        Pins or replaces a document in this session's working memory.
-        If a document with the same filename already exists, updates it.
-        """
+    ) -> PinnedDocRef:
+        """Pins a document to disk working memory via PinnedDocs."""
         with self._lock:
             self.touch()
-            # If doc_id not provided, check if filename already pinned
-            if not doc_id:
-                for existing_id, existing_doc in list(self.pinned_documents.items()):
-                    if existing_doc.filename == filename:
-                        doc_id = existing_id
-                        break
-            if not doc_id:
-                doc_id = f"doc_{uuid.uuid4().hex[:8]}"
-
-            doc = PinnedDocument(
-                doc_id=doc_id,
+            return self.docs.pin_file(
                 filename=filename,
                 extracted_text=extracted_text,
                 summary=summary,
-                size_kb=size_kb
+                size_kb=size_kb,
+                doc_id=doc_id
             )
-            self.pinned_documents[doc_id] = doc
-            logger.info(
-                f"[SessionMemory] Pinned document '{filename}' ({doc.token_count} est tokens) "
-                f"to session '{self.session_id}' (Total docs: {len(self.pinned_documents)})"
-            )
-            return doc
 
     def remove_document(self, doc_id_or_name: str) -> bool:
-        """Unpins a document by doc_id or filename."""
+        """Unpins a document and cleans up disk file."""
         with self._lock:
             self.touch()
-            if doc_id_or_name in self.pinned_documents:
-                del self.pinned_documents[doc_id_or_name]
-                return True
-            for d_id, doc in list(self.pinned_documents.items()):
-                if doc.filename == doc_id_or_name:
-                    del self.pinned_documents[d_id]
-                    return True
-            return False
+            return self.docs.remove_document(doc_id_or_name)
 
     def clear_documents(self) -> int:
-        """Removes all pinned documents from working memory."""
+        """Removes all pinned documents from disk working memory."""
         with self._lock:
             self.touch()
-            count = len(self.pinned_documents)
-            self.pinned_documents.clear()
-            return count
+            return self.docs.clear()
 
     def clear_messages(self) -> int:
-        """Clears conversation messages in this session."""
+        """Clears conversation messages."""
         with self._lock:
             self.touch()
-            count = len(self.messages)
-            self.messages.clear()
-            return count
-
-    def _prune_rolling_buffer(self) -> None:
-        """
-        Enforces turn count and token budget limits.
-        Retains initial system message (if present) and drops oldest user/assistant pairs.
-        """
-        if not self.messages:
-            return
-
-        # 1. Turn count limit check
-        while len(self.messages) > self.max_turns:
-            # If the first message is system, keep it and remove the 2nd message
-            if self.messages[0].role == "system" and len(self.messages) > 1:
-                self.messages.pop(1)
-            else:
-                self.messages.pop(0)
-
-        # 2. Token budget check
-        current_tokens = sum(m.token_count for m in self.messages)
-        while current_tokens > self.max_token_budget and len(self.messages) > 1:
-            if self.messages[0].role == "system" and len(self.messages) > 1:
-                removed = self.messages.pop(1)
-            else:
-                removed = self.messages.pop(0)
-            current_tokens -= removed.token_count
+            return self.chat.clear()
 
     def get_pinned_context_block(self, max_doc_tokens: int = 65536) -> str:
-        """
-        Constructs the structured working memory context block for pinned documents.
-        This is injected into Hermes-3 prompt for follow-up reasoning.
-        """
+        """Returns structured prompt context block from PinnedDocs."""
         with self._lock:
-            if not self.pinned_documents:
-                return ""
-
-            parts = [
-                f"[WORKING MEMORY: PINNED DOCUMENTS IN SESSION '{self.session_id}']",
-                "The following document context is pinned in short-term memory for this session.",
-                "You can answer follow-up questions, analyze details, or reference sections directly:\n"
-            ]
-
-            total_tokens = 0
-            for doc in self.pinned_documents.values():
-                header = f"=== [DOCUMENT: {doc.filename} | Summary: {doc.summary}] ==="
-                footer = f"=== [END DOCUMENT: {doc.filename}] ===\n"
-                
-                doc_text = doc.extracted_text
-                # Budget check per document
-                est_tok = doc.token_count
-                if total_tokens + est_tok > max_doc_tokens:
-                    allowed_chars = int((max_doc_tokens - total_tokens) * 3.8)
-                    if allowed_chars > 200:
-                        doc_text = doc_text[:allowed_chars] + "\n[... Document truncated to preserve context budget ...]"
-                    else:
-                        break
-
-                parts.append(f"{header}\n{doc_text}\n{footer}")
-                total_tokens += estimate_tokens(doc_text)
-
-            return "\n".join(parts)
+            max_chars = int(max_doc_tokens * 3.8)
+            return self.docs.get_context_block(max_chars=max_chars)
 
     def to_dict(self, include_doc_text: bool = False) -> Dict[str, Any]:
         """Serializes session state for the API endpoint."""
         with self._lock:
             now = time.time()
             ttl_remaining = max(0.0, self.ttl_seconds - (now - self.updated_at))
-            msg_tokens = sum(m.token_count for m in self.messages)
-            doc_tokens = sum(d.token_count for d in self.pinned_documents.values())
+            history = self.chat.get_history()
+            docs = list(self.docs.files.values())
+            msg_tokens = self.chat.total_tokens
+            doc_tokens = sum(d.token_count for d in docs)
 
             return {
                 "session_id": self.session_id,
@@ -278,13 +138,13 @@ class SessionState:
                 "updated_at": self.updated_at,
                 "ttl_seconds_remaining": round(ttl_remaining, 1),
                 "is_expired": self.is_expired(now),
-                "message_count": len(self.messages),
-                "pinned_document_count": len(self.pinned_documents),
+                "message_count": len(history),
+                "pinned_document_count": len(docs),
                 "total_estimated_tokens": msg_tokens + doc_tokens,
-                "messages": [m.to_dict() for m in self.messages],
+                "messages": [m.to_dict() for m in history],
                 "pinned_documents": [
                     d.to_dict(include_full_text=include_doc_text)
-                    for d in self.pinned_documents.values()
+                    for d in docs
                 ]
             }
 

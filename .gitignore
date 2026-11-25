@@ -12,4 +12,7 @@ ENV/
 .idea/
 .vscode/
 *.log
+pinned_docs/
+cache_dir/
+models/
 

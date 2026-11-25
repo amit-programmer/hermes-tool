@@ -1,0 +1,86 @@
+{
+  "app.py": {
+    "mtime": 1795620078.4688878,
+    "seen": 1795620129.0239947,
+    "ast_hash": "0130ef81d37feaf9fb70b1c798d34b7a",
+    "semantic_hash": ""
+  },
+  "big_file_handler.py": {
+    "mtime": 1795535715.243022,
+    "seen": 1795617821.8942666,
+    "ast_hash": "2c1b9b45f02715c00e8300e0a287801f",
+    "semantic_hash": ""
+  },
+  "cache_manager.py": {
+    "mtime": 1795357108.9373178,
+    "seen": 1795617821.8942666,
+    "ast_hash": "97a1070b54552da0c7f3dcd3532ab26f",
+    "semantic_hash": ""
+  },
+  "client_example.py": {
+    "mtime": 1794066716.2893276,
+    "seen": 1795617821.8942666,
+    "ast_hash": "fd7f4d467a58e874203aeee868afcc64",
+    "semantic_hash": ""
+  },
+  "model_manager.py": {
+    "mtime": 1795620009.0494027,
+    "seen": 1795620129.0239947,
+    "ast_hash": "e61d259ebacde10a209df343c52fe171",
+    "semantic_hash": ""
+  },
+  "rag_processing.py": {
+    "mtime": 1795357126.1533444,
+    "seen": 1795617821.8942666,
+    "ast_hash": "98cd3f9fd1977f4ec60f7e3238c2c3b7",
+    "semantic_hash": ""
+  },
+  "router.py": {
+    "mtime": 1795619991.8954625,
+    "seen": 1795620129.0239947,
+    "ast_hash": "8e37a3f8380d3bed800091142dbc37e8",
+    "semantic_hash": ""
+  },
+  "security_check.py": {
+    "mtime": 1795357101.6654193,
+    "seen": 1795617821.8942666,
+    "ast_hash": "fbf13964458eeff6d6d564d54ed5dbca",
+    "semantic_hash": ""
+  },
+  "session_memory.py": {
+    "mtime": 1795619965.1309803,
+    "seen": 1795620129.0239947,
+    "ast_hash": "d3beb07abaf4f81fdb43aed235b6a5af",
+    "semantic_hash": ""
+  },
+  "packages.txt": {
+    "mtime": 1795357167.5849469,
+    "seen": 1795617821.8942666,
+    "ast_hash": "cd674294488d3eae996429d58701afbb",
+    "semantic_hash": ""
+  },
+  "readme.md": {
+    "mtime": 1795352374.2298083,
+    "seen": 1795617821.8942666,
+    "ast_hash": "4cbfada9ea04b381e1fb29d9453b4630",
+    "semantic_hash": ""
+  },
+  "requirements.txt": {
+    "mtime": 1795533623.679197,
+    "seen": 1795617821.8942666,
+    "ast_hash": "f06089a42fa7f499a184572a8859cc1f",
+    "semantic_hash": ""
+  },
+  "chat_memory.py": {
+    "mtime": 1795619658.571028,
+    "seen": 1795620129.0239947,
+    "ast_hash": "b10f2daa241355f96e9c9ec53354413f",
+    "semantic_hash": ""
+  },
+  "pinned_docs.py": {
+    "mtime": 1795619917.367307,
+    "seen": 1795620129.0239947,
+    "ast_hash": "7b6c7fd6b710d6cfad593e8af95de711",
+    "semantic_hash": ""
+  }
+}

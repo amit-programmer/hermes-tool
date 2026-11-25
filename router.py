@@ -54,19 +54,41 @@ def is_greeting(message: str) -> bool:
         return True
     return False
 
-def identify_message(message: str, has_file: bool = False) -> Dict[str, Any]:
+def identify_message(message: str, has_file: bool = False, file_type: Optional[str] = None) -> Dict[str, Any]:
     """
     Evaluates message length, keyword density, and file presence.
     Returns:
         {
-            "route": "greeting" | "normal" | "coding" | "logical" | "file_task",
-            "model_type": "normal" | "coding" | "logical" | "heavy",
+            "route": "greeting" | "normal" | "coding" | "logical" | "vision" | "audio" | "file_task" | "heavy",
+            "model_type": "normal" | "coding" | "logical" | "vision" | "audio",
             "score": int,
             "is_greeting": bool,
             "has_file": bool,
             "reason": str
         }
     """
+    # 0. Specialized File Type Routing (Vision / Audio)
+    if file_type:
+        ft = file_type.strip().lower()
+        if ft in ("image", "png", "jpg", "jpeg", "webp", "gif") or any(ext in ft for ext in ["png", "jpg", "jpeg", "image"]):
+            return {
+                "route": "vision",
+                "model_type": "vision",
+                "score": 10,
+                "is_greeting": False,
+                "has_file": True,
+                "reason": f"Image attachment detected ({file_type}) -> Moondream2"
+            }
+        if ft in ("audio", "mp3", "wav", "m4a", "ogg", "flac") or any(ext in ft for ext in ["mp3", "wav", "audio", "voice"]):
+            return {
+                "route": "audio",
+                "model_type": "audio",
+                "score": 10,
+                "is_greeting": False,
+                "has_file": True,
+                "reason": f"Audio attachment detected ({file_type}) -> Whisper-Tiny"
+            }
+
     clean = (message or "").strip().lower()
     words = re.findall(r"\b\w+\b", clean)
     word_count = len(words)
@@ -92,6 +114,27 @@ def identify_message(message: str, has_file: bool = False) -> Dict[str, Any]:
             "has_file": has_file,
             "reason": f"Heavy task detected ({word_count} words / {len(message.splitlines())} lines) -> GPU Qwen Coder"
         }
+
+    # 1.6 File attachment visual / audio keyword inference
+    if has_file:
+        if any(w in clean for w in ["photo", "image", "tasveer", "picture", "screenshot", "diagram", "graph"]):
+            return {
+                "route": "vision",
+                "model_type": "vision",
+                "score": 10,
+                "is_greeting": False,
+                "has_file": True,
+                "reason": "Visual inquiry on attached file -> Moondream2"
+            }
+        if any(w in clean for w in ["audio", "voice", "recording", "speech", "sound", "transcribe", "sunao"]):
+            return {
+                "route": "audio",
+                "model_type": "audio",
+                "score": 10,
+                "is_greeting": False,
+                "has_file": True,
+                "reason": "Audio transcription inquiry -> Whisper-Tiny"
+            }
 
     score = 0
     detected_coding = []
