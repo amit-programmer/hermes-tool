@@ -82,6 +82,17 @@ def identify_message(message: str, has_file: bool = False) -> Dict[str, Any]:
             "reason": "Direct greeting detected"
         }
 
+    # 1.5 Heavy Input Check (> 500 words or > 100 lines of code)
+    if word_count > 500 or len(message.splitlines()) > 100:
+        return {
+            "route": "heavy",
+            "model_type": "coding",
+            "score": 15,
+            "is_greeting": False,
+            "has_file": has_file,
+            "reason": f"Heavy task detected ({word_count} words / {len(message.splitlines())} lines) -> GPU Qwen Coder"
+        }
+
     score = 0
     detected_coding = []
     detected_logical = []

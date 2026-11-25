@@ -51,13 +51,12 @@ except Exception as e:
                 return fn
             return decorator
 
-import torch
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    TextIteratorStreamer,
-    BitsAndBytesConfig
-)
+try:
+    from llama_cpp import Llama
+    HAS_LLAMA_CPP = True
+except Exception:
+    Llama = None
+    HAS_LLAMA_CPP = False
 import io
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
@@ -131,7 +130,7 @@ def _zerogpu_startup():
     pass
 
 # --- Configuration ---
-MODEL_ID = os.getenv("MODEL_ID", "NousResearch/Hermes-3-Llama-3.1-8B")
+MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen2.5-Coder-3B-Instruct")
 HF_TOKEN = (os.getenv("HF_TOKEN") or os.getenv("HF_ACCESS_TOKEN") or "").strip()
 AUTH_TOKEN = HF_TOKEN if HF_TOKEN else None
 HF_SPACE_URL = (
@@ -155,146 +154,15 @@ def get_default_system_prompt() -> str:
 
 DEFAULT_SYSTEM_PROMPT = get_default_system_prompt()
 
-# --- Global Model & Tokenizer Instances ---
-tokenizer = None
-model = None
-is_model_loading = False
+# Context budget for GGUF models
+MAX_CONTEXT_BUDGET = 8192
 model_load_error = None
-_model_load_lock = Lock()
-
-# Hermes-3 Llama 3.1 8B context window (128k native)
-MAX_CONTEXT_BUDGET = 131072
-
-def get_optimal_torch_dtype() -> torch.dtype:
-    """Selects bfloat16 for ZeroGPU / Ampere / Hopper / Ada, float16 for CUDA, float32 for CPU without top-level CUDA init."""
-    if HAS_SPACES:
-        return torch.bfloat16
-    return torch.float16 if sys.platform != "win32" else torch.float32
-
-def get_eos_token_ids(tok, custom_stops: Optional[List[str]] = None) -> List[int]:
-    """Retrieves all stop token IDs for Hermes-3 / Llama 3.1 plus optional custom stop tokens."""
-    stop_ids = set()
-    if tok is None:
-        return []
-
-    if tok.eos_token_id is not None:
-        if isinstance(tok.eos_token_id, (list, tuple, set)):
-            stop_ids.update(tok.eos_token_id)
-        else:
-            stop_ids.add(tok.eos_token_id)
-
-    # Core Hermes-3 and Llama 3.1 stop tokens
-    stop_token_strings = ["<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<|im_start|>"]
-    if custom_stops:
-        for cs in custom_stops:
-            if cs and cs not in stop_token_strings:
-                stop_token_strings.append(cs)
-
-    for token_str in stop_token_strings:
-        try:
-            tid = tok.convert_tokens_to_ids(token_str)
-            if tid is not None and isinstance(tid, int) and tid >= 0:
-                if tok.unk_token_id is None or tid != tok.unk_token_id:
-                    stop_ids.add(tid)
-        except Exception:
-            pass
-        try:
-            enc = tok.encode(token_str, add_special_tokens=False)
-            if len(enc) == 1 and enc[0] >= 0:
-                if tok.unk_token_id is None or enc[0] != tok.unk_token_id:
-                    stop_ids.add(enc[0])
-        except Exception:
-            pass
-
-    return list(stop_ids)
-
-def load_local_model():
-    """
-    Downloads and loads the model and tokenizer into memory with thread-safety.
-    Called inside @spaces.GPU inference context (zero nested decorator conflict).
-    Uses 4-bit quantization (BitsAndBytes NF4, ~5GB VRAM) on CUDA/ZeroGPU for optimal efficiency.
-    """
-    global tokenizer, model, is_model_loading, model_load_error
-    if model is not None and tokenizer is not None:
-        return model, tokenizer
-
-    with _model_load_lock:
-        if model is not None and tokenizer is not None:
-            return model, tokenizer
-
-        is_model_loading = True
-        try:
-            logger.info(f"1. Downloading / Loading Tokenizer for: {MODEL_ID}...")
-            tokenizer = AutoTokenizer.from_pretrained(
-                MODEL_ID,
-                token=AUTH_TOKEN,
-                trust_remote_code=True
-            )
-            if tokenizer.pad_token is None:
-                tokenizer.pad_token = tokenizer.eos_token
-
-            dtype = get_optimal_torch_dtype()
-            device_str = "cuda" if (HAS_SPACES or torch.cuda.is_available()) else "cpu"
-            logger.info(f"2. Target device detected: {device_str.upper()} (ZeroGPU: {HAS_SPACES}, Dtype: {dtype})")
-
-            # 4-bit Quantization Config (drastically drops memory from 16GB to ~5GB VRAM)
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-            )
-
-            load_kwargs = {
-                "pretrained_model_name_or_path": MODEL_ID,
-                "token": AUTH_TOKEN,
-                "quantization_config": bnb_config,
-                "device_map": "auto",
-                "low_cpu_mem_usage": True,
-                "trust_remote_code": True,
-            }
-
-            try:
-                logger.info("3. Loading 4-bit quantized model (BitsAndBytes NF4, ~5GB VRAM) with SDPA...")
-                model = AutoModelForCausalLM.from_pretrained(
-                    **load_kwargs,
-                    attn_implementation="sdpa"
-                )
-            except Exception as quant_sdpa_err:
-                try:
-                    logger.info(f"   Note on 4-bit SDPA mount ({quant_sdpa_err}); attempting default attention...")
-                    model = AutoModelForCausalLM.from_pretrained(**load_kwargs)
-                except Exception as quant_err:
-                    logger.warning(f"   4-bit load fallback ({quant_err}); loading standard precision...")
-                    load_kwargs.pop("quantization_config", None)
-                    load_kwargs["torch_dtype"] = dtype
-                    load_kwargs["device_map"] = "auto" if torch.cuda.is_available() else None
-                    model = AutoModelForCausalLM.from_pretrained(**load_kwargs)
-
-            model.eval()
-            # Ensure KV cache is enabled
-            if hasattr(model, "generation_config") and model.generation_config is not None:
-                model.generation_config.use_cache = True
-
-            logger.info(f"4. Model '{MODEL_ID}' successfully loaded into memory! KV Cache enabled.")
-            is_model_loading = False
-            model_load_error = None
-            return model, tokenizer
-
-        except Exception as e:
-            model_load_error = str(e)
-            is_model_loading = False
-            import traceback
-            traceback.print_exc()
-            logger.error(f"Failed to load model into memory: {e}\n{traceback.format_exc()}")
-            raise e
-            raise e
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
-    title="Hermes-3 8B Local API Server",
-    description="Standalone OpenAI-compatible inference server running Hermes-3 8B locally with zero external API limits.",
-    version="2.4.0"
+    title="Somi Multi-Model AI Gateway",
+    description="Hybrid CPU GGUF & ZeroGPU accelerated AI co-founder running Qwen Coder, DeepSeek R1 & Qwen 1.5B.",
+    version="3.0.0"
 )
 
 # Enable CORS for external bot & web access
@@ -371,161 +239,57 @@ def sanitize_assistant_output(raw_text: str, custom_stops: Optional[List[str]] =
 
     return raw_text[:earliest_pos].rstrip()
 
-def enforce_context_budget(prompt_text: str, max_tokens: int, tok) -> str:
-    """
-    Ensures prompt_text fits within the 128k context budget (131,072 tokens).
-    If prompt exceeds budget, gracefully truncates middle content while preserving
-    system prompt directives, document metadata headers, and latest user query.
-    """
-    max_input_tokens = max(1024, MAX_CONTEXT_BUDGET - max_tokens - 256)
+def enforce_context_budget(prompt_text: str, max_tokens: int = 300) -> str:
+    """Ensures prompt fits within 8192 context window using heuristic character estimation."""
+    max_chars = (MAX_CONTEXT_BUDGET - max_tokens - 100) * 4
+    if len(prompt_text) > max_chars:
+        logger.warning(f"[ContextBudget] Input prompt ({len(prompt_text)} chars) exceeds budget. Truncating middle...")
+        head = prompt_text[:int(max_chars * 0.65)]
+        tail = prompt_text[-int(max_chars * 0.35):]
+        return head + "\n\n[... Truncated to fit context window ...]\n\n" + tail
+    return prompt_text
 
-    # Fast estimation heuristic (~3.5 chars/token) before tokenizing
-    if len(prompt_text) < max_input_tokens * 3:
-        return prompt_text
+# --- CPU & ZeroGPU Generation Functions (Zero Torch / Zero Transformers) ---
 
-    if tok is None:
-        return prompt_text[:max_input_tokens * 4]
-
-    token_ids = tok.encode(prompt_text, add_special_tokens=False)
-    if len(token_ids) <= max_input_tokens:
-        return prompt_text
-
-    logger.warning(
-        f"[ContextBudget] Input prompt ({len(token_ids)} tokens) exceeds max input budget "
-        f"({max_input_tokens} tokens). Applying intelligent middle truncation..."
+def generate_on_cpu(prompt_text: str, model_type: str = "normal", max_tokens: int = 300) -> str:
+    """CPU generation using dynamic single-model GGUF manager."""
+    prompt_text = enforce_context_budget(prompt_text, max_tokens)
+    return model_manager.manager.generate(
+        prompt=prompt_text,
+        model_type=model_type,
+        max_tokens=max_tokens
     )
 
-    # Preserve beginning (system prompt, document head) and end (user query)
-    head_tokens = int(max_input_tokens * 0.65)
-    tail_tokens = max_input_tokens - head_tokens - 32
-
-    head_ids = token_ids[:head_tokens]
-    tail_ids = token_ids[-tail_tokens:] if tail_tokens > 0 else []
-
-    head_text = tok.decode(head_ids, skip_special_tokens=False)
-    tail_text = tok.decode(tail_ids, skip_special_tokens=False) if tail_ids else ""
-
-    notice = "\n\n[... Notice: Content truncated to fit within 128k token context budget ...]\n\n"
-    return head_text + notice + tail_text
-
-# --- Core Generation Function ---
-def _generate_core(
-    prompt_text: str,
-    max_tokens: int = 300,
-    temperature: float = 0.7,
-    top_p: float = 0.95,
-    stop: Optional[List[str]] = None
-) -> str:
-    """Generates complete text response directly using locally loaded model weights with KV cache."""
-    if model is None or tokenizer is None:
-        load_local_model()
-
-    device = model.device
-    prompt_text = enforce_context_budget(prompt_text, max_tokens, tokenizer)
-    max_input_len = max(1024, MAX_CONTEXT_BUDGET - max_tokens - 64)
-    inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=max_input_len).to(device)
-    stop_ids = get_eos_token_ids(tokenizer, custom_stops=stop)
-
-    gen_kwargs = {
-        **inputs,
-        "max_new_tokens": max_tokens,
-        "use_cache": True,
-        "pad_token_id": tokenizer.pad_token_id,
-        "eos_token_id": stop_ids,
-    }
-
-    if temperature is not None and temperature > 0.0:
-        gen_kwargs["do_sample"] = True
-        gen_kwargs["temperature"] = float(temperature)
-        gen_kwargs["top_p"] = float(top_p) if top_p is not None else 0.95
-    else:
-        gen_kwargs["do_sample"] = False
-
-    with torch.inference_mode():
-        outputs = model.generate(**gen_kwargs)
-
-    generated_tokens = outputs[0][inputs.input_ids.shape[-1]:]
-    raw_output = tokenizer.decode(generated_tokens, skip_special_tokens=False)
-    return sanitize_assistant_output(raw_output, custom_stops=stop)
-
-# --- Generation with ZeroGPU Decorators ---
 @spaces.GPU(duration=60)
-def generate_local(
-    prompt_text: str,
-    max_tokens: int = 300,
-    temperature: float = 0.7,
-    top_p: float = 0.95,
-    stop: Optional[List[str]] = None
-) -> str:
-    """Entrypoint for FastAPI inference requests on ZeroGPU."""
-    return _generate_core(prompt_text, max_tokens, temperature, top_p, stop=stop)
+def generate_on_gpu_heavy(prompt_text: str, max_tokens: int = 500) -> str:
+    """
+    ZeroGPU-accelerated generation for heavy tasks using the exact same Qwen Coder 3B GGUF.
+    - n_gpu_layers=-1 offloads all layers to ZeroGPU A100 VRAM
+    - n_ctx=8192 accommodates up to 1000+ lines of code
+    """
+    prompt_text = enforce_context_budget(prompt_text, max_tokens)
+    coder_path = model_manager.manager.get_model_path("coding")
+    if not HAS_LLAMA_CPP:
+        return generate_on_cpu(prompt_text, "coding", max_tokens=max_tokens)
 
-@spaces.GPU(duration=60)
-def stream_local_tokens(
-    prompt_text: str,
-    max_tokens: int = 300,
-    temperature: float = 0.7,
-    top_p: float = 0.95,
-    stop: Optional[List[str]] = None
-):
-    """Streams generated tokens in real-time chunk-by-chunk using TextIteratorStreamer."""
-    if model is None or tokenizer is None:
-        load_local_model()
-
-    device = model.device
-    prompt_text = enforce_context_budget(prompt_text, max_tokens, tokenizer)
-    max_input_len = max(1024, MAX_CONTEXT_BUDGET - max_tokens - 64)
-    inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=max_input_len).to(device)
-    stop_ids = get_eos_token_ids(tokenizer, custom_stops=stop)
-
-    streamer = TextIteratorStreamer(
-        tokenizer,
-        skip_prompt=True,
-        skip_special_tokens=False,
-        timeout=60.0
+    gpu_model = Llama(
+        model_path=coder_path,
+        n_ctx=8192,
+        n_gpu_layers=-1,
+        n_threads=4,
+        verbose=False
     )
+    result = gpu_model(prompt_text, max_tokens=max_tokens)
+    return result["choices"][0]["text"].strip()
 
-    gen_kwargs = {
-        **inputs,
-        "streamer": streamer,
-        "max_new_tokens": max_tokens,
-        "use_cache": True,
-        "pad_token_id": tokenizer.pad_token_id,
-        "eos_token_id": stop_ids,
-    }
-
-    if temperature is not None and temperature > 0.0:
-        gen_kwargs["do_sample"] = True
-        gen_kwargs["temperature"] = float(temperature)
-        gen_kwargs["top_p"] = float(top_p) if top_p is not None else 0.95
-    else:
-        gen_kwargs["do_sample"] = False
-
-    def _run_stream_worker():
-        with torch.inference_mode():
-            model.generate(**gen_kwargs)
-
-    thread = Thread(target=_run_stream_worker, daemon=True)
-    thread.start()
-
-    stop_markers = ["<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<|im_start|>"]
-    if stop:
-        for s in stop:
-            if s and s not in stop_markers:
-                stop_markers.append(s)
-
-    for new_text in streamer:
-        has_stop = False
-        for marker in stop_markers:
-            if marker in new_text:
-                pre_stop = new_text.split(marker)[0]
-                if pre_stop:
-                    yield pre_stop
-                has_stop = True
-                break
-        if has_stop:
-            break
-        yield new_text
+def stream_on_cpu(prompt_text: str, model_type: str = "normal", max_tokens: int = 300):
+    """Streams generated tokens chunk-by-chunk on CPU."""
+    prompt_text = enforce_context_budget(prompt_text, max_tokens)
+    model = model_manager.get_model(model_type)
+    for chunk in model(prompt_text, max_tokens=max_tokens, stream=True):
+        delta = chunk["choices"][0]["text"]
+        if delta:
+            yield delta
 
 # --- API Routes ---
 
@@ -563,36 +327,26 @@ async def list_models():
     return {
         "object": "list",
         "data": [
-            {"id": MODEL_ID, "object": "model", "created": int(START_TIME), "owned_by": "NousResearch"},
-            {"id": "Hermes-3-8B", "object": "model", "created": int(START_TIME), "owned_by": "NousResearch"},
-            {"id": "NousResearch/Hermes-3-Llama-3.1-8B", "object": "model", "created": int(START_TIME), "owned_by": "NousResearch"}
+            {"id": MODEL_ID, "object": "model", "created": int(START_TIME), "owned_by": "Qwen"},
+            {"id": "Qwen2.5-Coder-3B-Instruct", "object": "model", "created": int(START_TIME), "owned_by": "Qwen"},
+            {"id": "Qwen2.5-1.5B-Instruct", "object": "model", "created": int(START_TIME), "owned_by": "Qwen"},
+            {"id": "DeepSeek-R1-Distill-Qwen-1.5B", "object": "model", "created": int(START_TIME), "owned_by": "DeepSeek"}
         ]
     }
 
 @app.api_route("/v1/warmup", methods=["GET", "POST"])
 async def warmup_endpoint():
-    """Warms up local generation weights and pre-allocates KV cache."""
-    if model is None:
-        if is_model_loading:
-            return JSONResponse(
-                status_code=503,
-                content={"status": "loading", "message": "Model is currently loading into memory. Please retry in a few moments."}
-            )
-        try:
-            load_local_model()
-        except Exception as e:
-            return JSONResponse(status_code=500, content={"status": "error", "detail": str(e)})
-
+    """Warms up local generation weights and pre-allocates GGUF cache."""
     start = time.time()
     try:
-        dummy = generate_local("<|im_start|>user\nping<|im_end|>\n<|im_start|>assistant\n", 2, 0.5, 0.9)
+        dummy = generate_on_cpu("<|im_start|>user\nping<|im_end|>\n<|im_start|>assistant\n", "normal", 2)
         latency = (time.time() - start) * 1000.0
         return {
             "status": "warm",
             "latency_ms": round(latency, 2),
             "model": MODEL_ID,
-            "device": str(model.device) if model is not None else "unknown",
-            "message": "Local model is loaded, KV cache initialized, and kernels fully warm."
+            "backend": "GGUF CPU Engine",
+            "message": "Local GGUF model is loaded and ready for inference."
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "detail": str(e)})
@@ -773,12 +527,10 @@ async def chat_completions(req: ChatCompletionRequest):
                 yield f"data: {json.dumps(initial_chunk)}\n\n"
 
                 accumulated_text = []
-                for token_text in stream_local_tokens(
+                for token_text in stream_on_cpu(
                     prompt_text=prompt_text,
-                    max_tokens=req.max_tokens or 300,
-                    temperature=req.temperature,
-                    top_p=req.top_p,
-                    stop=custom_stops
+                    model_type=route_info.get("model_type", "normal"),
+                    max_tokens=req.max_tokens or 300
                 ):
                     accumulated_text.append(token_text)
                     chunk = {
@@ -848,36 +600,23 @@ async def chat_completions(req: ChatCompletionRequest):
     # 2. Non-Streaming Generation
     start_infer = time.time()
     try:
-        use_gguf = model_manager.HAS_LLAMA_CPP and route_info["model_type"] in ("normal", "coding", "logical") and request_queue.qsize() <= 5
-        model_used = f"GGUF ({route_info['model_type']})"
-        if use_gguf:
+        is_heavy = route_info.get("route") == "heavy" or request_queue.qsize() > 5 or len(prompt_text.split()) > 500
+        if is_heavy:
             try:
-                generated_content = model_manager.manager.generate(
-                    prompt=prompt_text,
-                    model_type=route_info["model_type"],
-                    max_tokens=req.max_tokens or 300,
-                    temperature=req.temperature or 0.7,
-                    top_p=req.top_p or 0.95
-                )
-            except Exception as gguf_err:
-                logger.warning(f"GGUF generation failed ({gguf_err}), falling back to GPU generator...")
-                generated_content = generate_local(
-                    prompt_text=prompt_text,
-                    max_tokens=req.max_tokens or 300,
-                    temperature=req.temperature,
-                    top_p=req.top_p,
-                    stop=custom_stops
-                )
-                model_used = "ZeroGPU Fallback"
+                logger.info("Routing heavy request to ZeroGPU Qwen Coder GGUF...")
+                generated_content = generate_on_gpu_heavy(prompt_text, max_tokens=req.max_tokens or 500)
+                model_used = "ZeroGPU (Qwen Coder 3B GGUF)"
+            except Exception as e:
+                logger.warning(f"GPU nahi mila, CPU pe bhej raha hu: {e}")
+                generated_content = generate_on_cpu(prompt_text, "coding", max_tokens=req.max_tokens or 300)
+                model_used = "CPU Fallback (Qwen Coder 3B)"
         else:
-            generated_content = generate_local(
+            generated_content = generate_on_cpu(
                 prompt_text=prompt_text,
-                max_tokens=req.max_tokens or 300,
-                temperature=req.temperature,
-                top_p=req.top_p,
-                stop=custom_stops
+                model_type=route_info.get("model_type", "normal"),
+                max_tokens=req.max_tokens or 300
             )
-            model_used = "ZeroGPU Hermes-3 8B"
+            model_used = f"CPU GGUF ({route_info.get('model_type', 'normal')})"
 
         if session and generated_content:
             session.add_message("assistant", generated_content)
@@ -896,9 +635,9 @@ async def chat_completions(req: ChatCompletionRequest):
 
     duration = time.time() - start_infer
 
-    # Accurate token usage metrics calculated via tokenizer
-    prompt_tokens = len(tokenizer.encode(prompt_text, add_special_tokens=False)) if tokenizer else max(len(prompt_text.split()), 1)
-    completion_tokens = len(tokenizer.encode(generated_content, add_special_tokens=False)) if tokenizer else max(len(generated_content.split()), 1)
+    # Token usage metrics
+    prompt_tokens = max(len(prompt_text.split()), 1)
+    completion_tokens = max(len(generated_content.split()), 1)
 
     res_payload = {
         "id": completion_id,
@@ -981,21 +720,18 @@ async def direct_chat_endpoint(req: DirectChatRequest):
     t0 = time.time()
     try:
         prompt = f"<|im_start|>system\n{DEFAULT_SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n{msg}<|im_end|>\n<|im_start|>assistant\n"
-        if model_manager.HAS_LLAMA_CPP:
+        is_heavy = route_info.get("route") == "heavy" or len(msg.split()) > 500
+        if is_heavy:
             try:
-                answer = model_manager.manager.generate(
-                    prompt=prompt,
-                    model_type=route_info["model_type"],
-                    max_tokens=req.max_tokens or 300
-                )
-                model_used = f"GGUF ({route_info['model_type']})"
+                answer = generate_on_gpu_heavy(prompt, max_tokens=req.max_tokens or 500)
+                model_used = "ZeroGPU (Qwen Coder 3B GGUF)"
             except Exception as e:
-                logger.warning(f"GGUF failed ({e}), falling back to GPU")
-                answer = generate_local(prompt, max_tokens=req.max_tokens or 300)
-                model_used = "ZeroGPU Fallback"
+                logger.warning(f"GPU nahi mila, CPU pe bhej raha hu: {e}")
+                answer = generate_on_cpu(prompt, "coding", max_tokens=req.max_tokens or 300)
+                model_used = "CPU Fallback (Qwen Coder 3B)"
         else:
-            answer = generate_local(prompt, max_tokens=req.max_tokens or 300)
-            model_used = "ZeroGPU Hermes-3 8B"
+            answer = generate_on_cpu(prompt, route_info["model_type"], max_tokens=req.max_tokens or 300)
+            model_used = f"CPU GGUF ({route_info['model_type']})"
 
         save_to_cache("chat", msg, answer)
         latency = (time.time() - t0) * 1000.0
@@ -2003,7 +1739,7 @@ async def chat_upload_and_complete(
         if len(chunks) > 5:
             # Use big file handler to select only relevant chunks for crisp context
             def _local_caller(p):
-                return generate_local(p, max_tokens=max_tokens or 300, temperature=temperature or 0.7)
+                return generate_on_cpu(p, "logical", max_tokens=max_tokens or 300)
             generated = process_big_file(temp_path, clean_ext, user_prompt, model_func=_local_caller)
         else:
             combined_user_content = (
@@ -2016,11 +1752,10 @@ async def chat_upload_and_complete(
                 Message(role="user", content=combined_user_content)
             ]
             prompt_text = construct_chatml_prompt(messages)
-            generated = generate_local(
+            generated = generate_on_cpu(
                 prompt_text=prompt_text,
-                max_tokens=max_tokens or 300,
-                temperature=temperature or 0.7,
-                top_p=0.95
+                model_type="logical",
+                max_tokens=max_tokens or 300
             )
 
         sess.add_message("assistant", generated)
@@ -3936,14 +3671,20 @@ try:
 
         prompt = construct_chatml_prompt(conversation)
         try:
-            return _generate_core(prompt, 300, 0.7, 0.95)
+            route_info = identify_message(user_message)
+            if route_info.get("route") == "heavy":
+                try:
+                    return generate_on_gpu_heavy(prompt, 500)
+                except Exception:
+                    return generate_on_cpu(prompt, "coding", 300)
+            return generate_on_cpu(prompt, route_info.get("model_type", "normal"), 300)
         except Exception as e:
             return f"❌ Error: {str(e)}"
 
     demo = gr.ChatInterface(
         fn=gradio_chat_fn,
-        title="Hermes-3 8B In-Memory Chat",
-        description="Running directly on Nvidia A100 ZeroGPU. Lead Architect persona active."
+        title="Somi Multi-Model AI Co-Founder",
+        description="GGUF CPU & ZeroGPU accelerated AI co-founder running Qwen Coder, DeepSeek R1 & Qwen 1.5B."
     )
 
     app = gr.mount_gradio_app(app, demo, path="/gradio")
