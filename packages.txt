@@ -1,2 +1,4 @@
 libgl1
 libmagic1
+libgomp1
+
